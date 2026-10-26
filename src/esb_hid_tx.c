@@ -78,30 +78,53 @@ static void diag_boot_blink(void) {
 }
 
 static volatile bool diag_event_seen;
-static volatile bool diag_init_failed;
+static volatile int diag_init_err;
+
+/* When link start failed, blink |err| in red as two digit groups
+ * (tens, gap, ones), repeating. Lets us read the exact error code
+ * off the LED without a log console. */
+static bool diag_code_blink(struct k_work_delayable *dwork) {
+    if (diag_init_err == 0) {
+        return false;
+    }
+    int code = diag_init_err < 0 ? -diag_init_err : diag_init_err;
+    int tens = code / 10;
+    int ones = code % 10;
+    int cycle = 2 * tens + 3 + 2 * ones + 8;
+    static int slot;
+
+    int s = slot++ % cycle;
+    bool on = false;
+
+    if (s < 2 * tens) {
+        on = (s % 2) == 0;
+    } else if (s >= 2 * tens + 3 && s < 2 * tens + 3 + 2 * ones) {
+        on = ((s - (2 * tens + 3)) % 2) == 0;
+    }
+    gpio_pin_set_dt(&diag_led_red, on ? 1 : 0);
+    gpio_pin_set_dt(&diag_led_green, 0);
+    k_work_reschedule(dwork, K_MSEC(200));
+    return true;
+}
 
 static void diag_alive(struct k_work *work) {
-    static bool on;
-
-    on = !on;
-    if (diag_init_failed) {
-        /* esb_init/link start failed: fast red blink, distinct from
-         * every other state. */
-        gpio_pin_set_dt(&diag_led_red, on ? 1 : 0);
-        k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(150));
+    if (diag_code_blink(k_work_delayable_from_work(work))) {
         return;
     }
     if (diag_event_seen) {
         gpio_pin_set_dt(&diag_led_green, 0);
         return;
     }
+    static bool on;
+
+    on = !on;
     gpio_pin_set_dt(&diag_led_green, on ? 1 : 0);
     k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(300));
 }
 
 static K_WORK_DELAYABLE_DEFINE(diag_alive_work, diag_alive);
 
-static void diag_note_init(int err) { diag_init_failed = err != 0; }
+static void diag_note_init(int err) { diag_init_err = err; }
 
 static void diag_tx_event(enum esb_evt_id evt_id) {
     diag_event_seen = true;

@@ -85,15 +85,29 @@ static const struct gpio_dt_spec link_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpi
 static const struct gpio_dt_spec link_led_red = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static int64_t link_last_frame_ms;
 static bool link_led_on;
-static bool rx_init_failed;
+static int rx_init_err;
 
 static void link_blink(struct k_work *work) {
-    if (rx_init_failed) {
-        /* esb_init/link start failed on the receiver: blink red
-         * instead of the green liveness pattern. */
-        link_led_on = !link_led_on;
-        gpio_pin_set_dt(&link_led_red, link_led_on ? 1 : 0);
-        k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(ESB_HID_LINK_BLINK_MS));
+    if (rx_init_err != 0) {
+        /* Link start failed: blink |err| in red as two digit groups
+         * (tens, gap, ones), repeating — same code as the TX diag. */
+        int code = rx_init_err < 0 ? -rx_init_err : rx_init_err;
+        int tens = code / 10;
+        int ones = code % 10;
+        int cycle = 2 * tens + 3 + 2 * ones + 8;
+        static int slot;
+
+        int s = slot++ % cycle;
+        bool on = false;
+
+        if (s < 2 * tens) {
+            on = (s % 2) == 0;
+        } else if (s >= 2 * tens + 3 && s < 2 * tens + 3 + 2 * ones) {
+            on = ((s - (2 * tens + 3)) % 2) == 0;
+        }
+        gpio_pin_set_dt(&link_led_red, on ? 1 : 0);
+        gpio_pin_set_dt(&link_led, 0);
+        k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(200));
         return;
     }
 
@@ -182,7 +196,7 @@ static int esb_hid_rx_init(void) {
 #endif
     int err = esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
 #if ESB_HID_LINK_LED
-    rx_init_failed = err != 0;
+    rx_init_err = err;
 #endif
     return err;
 }
