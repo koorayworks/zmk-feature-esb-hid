@@ -1,0 +1,22 @@
+# HID over ESB module configuration.
+# The vendored Nordic ESB stack (esb/) brings its own Kconfig (CONFIG_ESB*).
+
+rsource "esb/Kconfig"
+
+config ZMK_ESB_HID
+	bool "HID over ESB transport (keyboard side)"
+	depends on SOC_SERIES_NRF52X || SOC_SERIES_NRF53X || SOC_SERIES_NRF54LX
+	select ESB
+	help
+	  Send this keyboard's HID reports (keyboard / consumer / mouse) over
+	  Nordic ESB to a receiver running the same module with
+	  ZMK_ESB_HID_RECEIVER enabled. Requires the ZMK fork hooks
+	  (ZMK_TRANSPORT_ESB in endpoints).
+
+config ZMK_ESB_HID_RECEIVER
+	bool "HID over ESB receiver (ESB to USB HID)"
+	depends on SOC_SERIES_NRF52X || SOC_SERIES_NRF53X || SOC_SERIES_NRF54LX
+	select ESB
+	help
+	  Receive HID reports over Nordic ESB and forward them to USB HID.
+	  Intended for a matrix-less ZMK build acting as the receiver.

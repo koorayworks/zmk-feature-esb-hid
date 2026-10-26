@@ -1,0 +1,6 @@
+name: zmk-feature-esb-hid
+build:
+  cmake: .
+  kconfig: Kconfig
+  settings:
+    board_root: .
