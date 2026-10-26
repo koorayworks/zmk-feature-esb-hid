@@ -85,4 +85,6 @@ static int esb_hid_rx_init(void) {
     return esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
 }
 
-SYS_INIT(esb_hid_rx_init, APPLICATION, 95);
+/* After the USB HID init (CONFIG_ZMK_USB_HID_INIT_PRIORITY=95) so early
+ * frames are not forwarded to a not-yet-registered HID device. */
+SYS_INIT(esb_hid_rx_init, APPLICATION, 96);

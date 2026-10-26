@@ -164,4 +164,7 @@ static int esb_hid_tx_init(void) {
     return 0;
 }
 
-SYS_INIT(esb_hid_tx_init, APPLICATION, 95);
+/* Must run before ZMK endpoints init (CONFIG_APPLICATION_INIT_PRIORITY=90),
+ * otherwise the endpoint selection happens while the link is not ready
+ * yet and the ESB transport is never selected on the keyboard side. */
+SYS_INIT(esb_hid_tx_init, APPLICATION, 80);
