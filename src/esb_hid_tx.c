@@ -12,6 +12,7 @@
  * when the queue is full.
  */
 
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
@@ -32,6 +33,63 @@
 
 LOG_MODULE_DECLARE(esb_hid);
 
+/* TX diagnostics on the board's user LEDs (XIAO: led0=red, led1=green,
+ * led2=blue), so the radio state is visible without a console:
+ * - boot: green blinks 3x once the TX thread runs (module alive)
+ * - TX_SUCCESS (ACK received): blue pulse
+ * - TX_FAILED (no ACK after ESB retransmits): red pulse
+ * Boards without the aliases build without the diagnostics. */
+#if DT_NODE_EXISTS(DT_ALIAS(led0)) && DT_NODE_EXISTS(DT_ALIAS(led1)) && DT_NODE_EXISTS(DT_ALIAS(led2))
+#define ESB_HID_TX_DIAG_LED 1
+static const struct gpio_dt_spec diag_led_red = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec diag_led_green = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec diag_led_blue = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+
+static void diag_blue_off(struct k_work *work) {
+    ARG_UNUSED(work);
+    gpio_pin_set_dt(&diag_led_blue, 0);
+}
+static void diag_red_off(struct k_work *work) {
+    ARG_UNUSED(work);
+    gpio_pin_set_dt(&diag_led_red, 0);
+}
+static K_WORK_DELAYABLE_DEFINE(diag_blue_work, diag_blue_off);
+static K_WORK_DELAYABLE_DEFINE(diag_red_work, diag_red_off);
+
+static void diag_pulse(const struct gpio_dt_spec *led, struct k_work_delayable *work) {
+    gpio_pin_set_dt(led, 1);
+    k_work_reschedule(work, K_MSEC(80));
+}
+
+static void diag_boot_blink(void) {
+    const struct gpio_dt_spec *leds[] = {&diag_led_red, &diag_led_green, &diag_led_blue};
+
+    for (size_t i = 0; i < ARRAY_SIZE(leds); i++) {
+        if (gpio_is_ready_dt(leds[i])) {
+            gpio_pin_configure_dt(leds[i], GPIO_OUTPUT_INACTIVE);
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        gpio_pin_set_dt(&diag_led_green, 1);
+        k_msleep(90);
+        gpio_pin_set_dt(&diag_led_green, 0);
+        k_msleep(90);
+    }
+}
+
+static void diag_tx_event(enum esb_evt_id evt_id) {
+    if (evt_id == ESB_EVENT_TX_SUCCESS) {
+        diag_pulse(&diag_led_blue, &diag_blue_work);
+    } else if (evt_id == ESB_EVENT_TX_FAILED) {
+        diag_pulse(&diag_led_red, &diag_red_work);
+    }
+}
+#else
+#define ESB_HID_TX_DIAG_LED 0
+static void diag_boot_blink(void) {}
+static void diag_tx_event(enum esb_evt_id evt_id) { ARG_UNUSED(evt_id); }
+#endif
+
 struct esb_hid_frame {
     uint8_t type;
     uint8_t seq;
@@ -50,6 +108,7 @@ static K_SEM_DEFINE(tx_done_sem, 0, 1);
 static volatile bool tx_last_ok;
 
 static void esb_hid_tx_event_handler(const struct esb_evt *evt) {
+    diag_tx_event(evt->evt_id);
     switch (evt->evt_id) {
     case ESB_EVENT_TX_SUCCESS:
         tx_last_ok = true;
@@ -181,6 +240,8 @@ static void send_frame(const struct esb_hid_frame *frame) {
 
 static void tx_thread(void) {
     struct esb_hid_frame frame;
+
+    diag_boot_blink();
 
     while (1) {
         if (k_msgq_get(&esb_hid_tx_queue, &frame, K_MSEC(20)) == 0) {
