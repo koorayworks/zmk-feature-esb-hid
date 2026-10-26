@@ -13,6 +13,7 @@
 
 #include <esb.h>
 #include <esb_hid_status.h>
+#include <zephyr/drivers/gpio.h>
 #include <zmk/hid.h>
 #include <zmk/usb_hid.h>
 
@@ -68,6 +69,31 @@ static const uint8_t report_ids[ESB_HID_TYPE_COUNT] = {
     ZMK_HID_REPORT_ID_MOUSE,
 };
 
+/* Link indicator: pulse the board's green user LED (devicetree alias
+ * led1) for every accepted frame. The TX heartbeat (status frame every
+ * 30 s) keeps it blinking while the link is alive, and key traffic makes
+ * it flicker, so link state is visible without pressing anything.
+ * Boards without the alias simply build without the indicator. */
+#if DT_NODE_EXISTS(DT_ALIAS(led1))
+#define ESB_HID_LINK_LED 1
+static const struct gpio_dt_spec link_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+
+static void link_led_off(struct k_work *work) {
+    ARG_UNUSED(work);
+    gpio_pin_set_dt(&link_led, 0);
+}
+
+static K_WORK_DELAYABLE_DEFINE(link_led_work, link_led_off);
+
+static void link_led_pulse(void) {
+    gpio_pin_set_dt(&link_led, 1);
+    k_work_reschedule(&link_led_work, K_MSEC(120));
+}
+#else
+#define ESB_HID_LINK_LED 0
+static void link_led_pulse(void) {}
+#endif
+
 static void esb_hid_rx_event_handler(const struct esb_evt *evt) {
     if (evt->evt_id == ESB_EVENT_RX_RECEIVED) {
         k_sem_give(&rx_sem);
@@ -97,6 +123,8 @@ static void handle_payload(const struct esb_payload *payload) {
         last_seq[type] = seq;
     }
 
+    link_led_pulse();
+
     if (type == ESB_HID_TYPE_STATUS) {
         handle_status(&payload->data[ESB_HID_FRAME_HDR_LEN],
                       payload->length - ESB_HID_FRAME_HDR_LEN);
@@ -125,6 +153,11 @@ static void rx_thread(void) {
 K_THREAD_DEFINE(esb_hid_rx_thread, 1024, rx_thread, NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, 0);
 
 static int esb_hid_rx_init(void) {
+#if ESB_HID_LINK_LED
+    if (gpio_is_ready_dt(&link_led)) {
+        gpio_pin_configure_dt(&link_led, GPIO_OUTPUT_INACTIVE);
+    }
+#endif
     return esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
 }
 
