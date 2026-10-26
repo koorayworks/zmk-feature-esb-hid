@@ -1390,7 +1390,12 @@ static int sys_timer_init(void)
 	};
 
 	err = nrfx_timer_init(&esb_timer, &config, esb_timer_handler);
-	if (err) {
+	/* PORTING PATCH (plain Zephyr): upstream ESB targets the NCS nrfx,
+	 * where NRFX_SUCCESS == 0, so a bare `if (err)` works there. Zephyr
+	 * 4.1's bundled nrfx defines NRFX_SUCCESS as 0x0BAD0000, which made
+	 * a successful init look like a failure (and left the timer driver
+	 * initialized, so retries failed with NRFX_ERROR_ALREADY). */
+	if (err != NRFX_SUCCESS) {
 		LOG_ERR("Failed to initialize nrfx timer (err %d)", err);
 		return -EFAULT;
 	}
