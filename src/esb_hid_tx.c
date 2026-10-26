@@ -21,6 +21,7 @@
 
 #include <esb.h>
 #include <zmk/battery.h>
+#include <zmk/endpoints.h>
 #include <zmk/esb_hid.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/battery_state_changed.h>
@@ -343,6 +344,11 @@ static void link_retry(struct k_work *work) {
     }
 
     link_ready = true;
+    /* The endpoint layer evaluated transports at boot, when the ESB
+     * link was not ready yet, and nothing re-triggers it (no USB/BLE
+     * state events in this build). Ask it to re-evaluate now, or key
+     * reports are silently dropped as "no transport selected". */
+    zmk_endpoint_update_current();
     k_work_schedule(&status_work, K_SECONDS(1));
 }
 
