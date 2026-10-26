@@ -69,29 +69,38 @@ static const uint8_t report_ids[ESB_HID_TYPE_COUNT] = {
     ZMK_HID_REPORT_ID_MOUSE,
 };
 
-/* Link indicator: pulse the board's green user LED (devicetree alias
- * led1) for every accepted frame. The TX heartbeat (status frame every
- * 30 s) keeps it blinking while the link is alive, and key traffic makes
- * it flicker, so link state is visible without pressing anything.
- * Boards without the alias simply build without the indicator. */
+/* Link indicator: blink the board's green user LED (devicetree alias
+ * led1) for as long as the link is alive. Any accepted frame refreshes
+ * the liveness timestamp; the TX status heartbeat (every 30 s) keeps
+ * the link marked alive while the keyboard is on, so this blinks
+ * continuously during normal use and stops within the timeout after
+ * the TX goes away. Boards without the alias build without it. */
 #if DT_NODE_EXISTS(DT_ALIAS(led1))
 #define ESB_HID_LINK_LED 1
+
+#define ESB_HID_LINK_ALIVE_MS 45000 /* 1.5x the TX heartbeat period */
+#define ESB_HID_LINK_BLINK_MS 250
+
 static const struct gpio_dt_spec link_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static int64_t link_last_frame_ms;
+static bool link_led_on;
 
-static void link_led_off(struct k_work *work) {
-    ARG_UNUSED(work);
-    gpio_pin_set_dt(&link_led, 0);
+static void link_blink(struct k_work *work) {
+    bool alive = link_last_frame_ms > 0 &&
+                 (k_uptime_get() - link_last_frame_ms) < ESB_HID_LINK_ALIVE_MS;
+
+    link_led_on = alive && !link_led_on;
+    gpio_pin_set_dt(&link_led, link_led_on ? 1 : 0);
+
+    k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(ESB_HID_LINK_BLINK_MS));
 }
 
-static K_WORK_DELAYABLE_DEFINE(link_led_work, link_led_off);
+static K_WORK_DELAYABLE_DEFINE(link_blink_work, link_blink);
 
-static void link_led_pulse(void) {
-    gpio_pin_set_dt(&link_led, 1);
-    k_work_reschedule(&link_led_work, K_MSEC(120));
-}
+static void link_led_note_frame(void) { link_last_frame_ms = k_uptime_get(); }
 #else
 #define ESB_HID_LINK_LED 0
-static void link_led_pulse(void) {}
+static void link_led_note_frame(void) {}
 #endif
 
 static void esb_hid_rx_event_handler(const struct esb_evt *evt) {
@@ -123,7 +132,7 @@ static void handle_payload(const struct esb_payload *payload) {
         last_seq[type] = seq;
     }
 
-    link_led_pulse();
+    link_led_note_frame();
 
     if (type == ESB_HID_TYPE_STATUS) {
         handle_status(&payload->data[ESB_HID_FRAME_HDR_LEN],
@@ -156,6 +165,7 @@ static int esb_hid_rx_init(void) {
 #if ESB_HID_LINK_LED
     if (gpio_is_ready_dt(&link_led)) {
         gpio_pin_configure_dt(&link_led, GPIO_OUTPUT_INACTIVE);
+        k_work_schedule(&link_blink_work, K_MSEC(ESB_HID_LINK_BLINK_MS));
     }
 #endif
     return esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
