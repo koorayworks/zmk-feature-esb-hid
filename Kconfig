@@ -7,6 +7,7 @@ config ZMK_ESB_HID
 	bool "HID over ESB transport (keyboard side)"
 	depends on SOC_SERIES_NRF52X || SOC_SERIES_NRF53X || SOC_SERIES_NRF54LX
 	select ESB
+	select ESB_CLOCK_INIT
 	help
 	  Send this keyboard's HID reports (keyboard / consumer / mouse) over
 	  Nordic ESB to a receiver running the same module with
@@ -17,6 +18,7 @@ config ZMK_ESB_HID_RECEIVER
 	bool "HID over ESB receiver (ESB to USB HID)"
 	depends on SOC_SERIES_NRF52X || SOC_SERIES_NRF53X || SOC_SERIES_NRF54LX
 	select ESB
+	select ESB_CLOCK_INIT
 	help
 	  Receive HID reports over Nordic ESB and forward them to USB HID.
 	  Intended for a matrix-less ZMK build acting as the receiver.
