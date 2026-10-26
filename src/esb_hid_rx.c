@@ -186,6 +186,24 @@ static void rx_thread(void) {
 
 K_THREAD_DEFINE(esb_hid_rx_thread, 1024, rx_thread, NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, 0);
 
+static void rx_link_retry(struct k_work *work);
+
+/* Same retry contract as the TX side: while link start fails, retry
+ * every 5 s so the failing stage keeps logging its error. */
+static K_WORK_DELAYABLE_DEFINE(rx_link_retry_work, rx_link_retry);
+
+static void rx_link_retry(struct k_work *work) {
+    int err = esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
+
+#if ESB_HID_LINK_LED
+    rx_init_err = err;
+#endif
+    if (err) {
+        LOG_ERR("ESB RX link start failed: %d (retry in 5s)", err);
+        k_work_reschedule(&rx_link_retry_work, K_SECONDS(5));
+    }
+}
+
 static int esb_hid_rx_init(void) {
 #if ESB_HID_LINK_LED
     if (gpio_is_ready_dt(&link_led)) {
@@ -198,7 +216,12 @@ static int esb_hid_rx_init(void) {
 #if ESB_HID_LINK_LED
     rx_init_err = err;
 #endif
-    return err;
+    if (err) {
+        LOG_ERR("ESB RX link start failed: %d (retry in 5s)", err);
+        k_work_schedule(&rx_link_retry_work, K_SECONDS(5));
+        return 0;
+    }
+    return 0;
 }
 
 /* After the USB HID init (CONFIG_ZMK_USB_HID_INIT_PRIORITY=95) so early

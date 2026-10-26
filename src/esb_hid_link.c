@@ -34,24 +34,29 @@ int esb_hid_link_start(enum esb_mode mode, esb_event_handler handler) {
 
     err = esb_set_base_address_0(base_address_0);
     if (err) {
+        LOG_ERR("esb_set_base_address_0 failed: %d", err);
         return err;
     }
     err = esb_set_base_address_1(base_address_1);
     if (err) {
+        LOG_ERR("esb_set_base_address_1 failed: %d", err);
         return err;
     }
     err = esb_set_prefixes(pipe_prefixes, ARRAY_SIZE(pipe_prefixes));
     if (err) {
+        LOG_ERR("esb_set_prefixes failed: %d", err);
         return err;
     }
     err = esb_enable_pipes(0x01);
     if (err) {
+        LOG_ERR("esb_enable_pipes failed: %d", err);
         return err;
     }
 
     if (mode == ESB_MODE_PRX) {
         err = esb_start_rx();
         if (err) {
+            LOG_ERR("esb_start_rx failed: %d", err);
             return err;
         }
     }

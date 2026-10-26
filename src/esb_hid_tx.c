@@ -324,11 +324,34 @@ static void tx_thread(void) {
 
 K_THREAD_DEFINE(esb_hid_tx_thread, 1024, tx_thread, NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, 0);
 
+static void link_retry(struct k_work *work);
+
+/* While link start keeps failing, retry every 5 s: the failing stage
+ * logs its own error each attempt, so a log console attached at any
+ * point sees the reason within seconds (no boot-log race). */
+static K_WORK_DELAYABLE_DEFINE(link_retry_work, link_retry);
+
+static void link_retry(struct k_work *work) {
+    int err = esb_hid_link_start(ESB_MODE_PTX, esb_hid_tx_event_handler);
+
+    diag_note_init(err);
+    if (err) {
+        LOG_ERR("ESB link start failed: %d (retry in 5s)", err);
+        k_work_reschedule(&link_retry_work, K_SECONDS(5));
+        return;
+    }
+
+    link_ready = true;
+    k_work_schedule(&status_work, K_SECONDS(1));
+}
+
 static int esb_hid_tx_init(void) {
     int err = esb_hid_link_start(ESB_MODE_PTX, esb_hid_tx_event_handler);
     diag_note_init(err);
     if (err) {
-        return err;
+        LOG_ERR("ESB link start failed: %d (retry in 5s)", err);
+        k_work_schedule(&link_retry_work, K_SECONDS(5));
+        return 0;
     }
 
     link_ready = true;
