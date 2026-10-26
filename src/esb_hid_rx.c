@@ -12,6 +12,7 @@
 #include <zephyr/logging/log.h>
 
 #include <esb.h>
+#include <esb_hid_status.h>
 #include <zmk/hid.h>
 #include <zmk/usb_hid.h>
 
@@ -21,6 +22,42 @@
 LOG_MODULE_DECLARE(esb_hid);
 
 static K_SEM_DEFINE(rx_sem, 0, K_SEM_MAX_LIMIT);
+
+/* Latest status frame per device. Step 1/2: only device 0 exists. */
+static struct esb_hid_device_status device_status;
+
+bool esb_hid_get_device_status(uint8_t device_index, struct esb_hid_device_status *out) {
+    if (device_index != 0 || !device_status.valid) {
+        return false;
+    }
+    *out = device_status;
+    return true;
+}
+
+static void handle_status(const uint8_t *data, size_t len) {
+    if (len != sizeof(struct esb_hid_status_body)) {
+        LOG_WRN("Malformed status frame (len %d)", (int)len);
+        return;
+    }
+
+    const struct esb_hid_status_body *body = (const struct esb_hid_status_body *)data;
+
+    if (!device_status.valid || device_status.battery != body->battery ||
+        device_status.layer != body->layer) {
+        if (body->battery == ESB_HID_BATTERY_UNKNOWN) {
+            LOG_INF("Peer status: battery unknown, layer %d", body->layer);
+        } else {
+            LOG_INF("Peer status: battery %d%%, layer %d", body->battery, body->layer);
+        }
+    }
+
+    device_status.battery = body->battery;
+    device_status.layer = body->layer;
+    device_status.flags = body->flags;
+    device_status.proto_version = body->proto_version;
+    device_status.last_update_ms = k_uptime_get();
+    device_status.valid = true;
+}
 
 static uint8_t last_seq[ESB_HID_TYPE_COUNT];
 static bool seq_valid[ESB_HID_TYPE_COUNT];
@@ -49,7 +86,7 @@ static void handle_payload(const struct esb_payload *payload) {
         return;
     }
 
-    /* Keyboard/consumer are absolute state: drop exact duplicates
+    /* Keyboard/consumer/status are state: drop exact duplicates
      * (e.g. a re-delivered frame after a lost ACK). Mouse is relative;
      * every frame carries new motion, so forward all of them. */
     if (type != ESB_HID_TYPE_MOUSE) {
@@ -58,6 +95,12 @@ static void handle_payload(const struct esb_payload *payload) {
         }
         seq_valid[type] = true;
         last_seq[type] = seq;
+    }
+
+    if (type == ESB_HID_TYPE_STATUS) {
+        handle_status(&payload->data[ESB_HID_FRAME_HDR_LEN],
+                      payload->length - ESB_HID_FRAME_HDR_LEN);
+        return;
     }
 
     int err = zmk_usb_hid_send_report_with_id(report_ids[type],

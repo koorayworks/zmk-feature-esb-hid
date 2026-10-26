@@ -19,8 +19,13 @@
 #include <string.h>
 
 #include <esb.h>
+#include <zmk/battery.h>
 #include <zmk/esb_hid.h>
+#include <zmk/event_manager.h>
+#include <zmk/events/battery_state_changed.h>
+#include <zmk/events/layer_state_changed.h>
 #include <zmk/hid.h>
+#include <zmk/keymap.h>
 
 #include "esb_hid_frame.h"
 #include "esb_hid_link.h"
@@ -82,6 +87,54 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len) {
 
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Status frames (battery / layer)                                     */
+
+#define ESB_HID_STATUS_HEARTBEAT K_SECONDS(30)
+
+static void send_status_snapshot(void) {
+    struct esb_hid_status_body body = {
+        .battery = ESB_HID_BATTERY_UNKNOWN,
+        .layer = (uint8_t)zmk_keymap_highest_layer_active(),
+        .flags = 0,
+        .proto_version = ESB_HID_PROTOCOL_VERSION,
+    };
+
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+    body.battery = zmk_battery_state_of_charge();
+#endif
+
+    enqueue_report(ESB_HID_TYPE_STATUS, (const uint8_t *)&body, sizeof(body));
+}
+
+static void status_heartbeat(struct k_work *work) {
+    ARG_UNUSED(work);
+    send_status_snapshot();
+    k_work_reschedule(k_work_delayable_from_work(work), ESB_HID_STATUS_HEARTBEAT);
+}
+
+static K_WORK_DELAYABLE_DEFINE(status_work, status_heartbeat);
+
+static int esb_hid_tx_listener(const zmk_event_t *eh) {
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+    if (as_zmk_battery_state_changed(eh) != NULL) {
+        send_status_snapshot();
+        return 0;
+    }
+#endif
+    if (as_zmk_layer_state_changed(eh) != NULL) {
+        send_status_snapshot();
+        return 0;
+    }
+    return 0;
+}
+
+ZMK_LISTENER(esb_hid_tx, esb_hid_tx_listener);
+ZMK_SUBSCRIPTION(esb_hid_tx, zmk_layer_state_changed);
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+ZMK_SUBSCRIPTION(esb_hid_tx, zmk_battery_state_changed);
+#endif
 
 bool zmk_esb_hid_is_ready(void) { return link_ready; }
 
@@ -161,6 +214,10 @@ static int esb_hid_tx_init(void) {
     }
 
     link_ready = true;
+
+    /* First status frame shortly after boot, then as a heartbeat. */
+    k_work_schedule(&status_work, K_SECONDS(1));
+
     return 0;
 }
 
