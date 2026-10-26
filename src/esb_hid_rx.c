@@ -75,17 +75,28 @@ static const uint8_t report_ids[ESB_HID_TYPE_COUNT] = {
  * the link marked alive while the keyboard is on, so this blinks
  * continuously during normal use and stops within the timeout after
  * the TX goes away. Boards without the alias build without it. */
-#if DT_NODE_EXISTS(DT_ALIAS(led1))
+#if DT_NODE_EXISTS(DT_ALIAS(led1)) && DT_NODE_EXISTS(DT_ALIAS(led0))
 #define ESB_HID_LINK_LED 1
 
 #define ESB_HID_LINK_ALIVE_MS 45000 /* 1.5x the TX heartbeat period */
 #define ESB_HID_LINK_BLINK_MS 250
 
 static const struct gpio_dt_spec link_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec link_led_red = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static int64_t link_last_frame_ms;
 static bool link_led_on;
+static bool rx_init_failed;
 
 static void link_blink(struct k_work *work) {
+    if (rx_init_failed) {
+        /* esb_init/link start failed on the receiver: blink red
+         * instead of the green liveness pattern. */
+        link_led_on = !link_led_on;
+        gpio_pin_set_dt(&link_led_red, link_led_on ? 1 : 0);
+        k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(ESB_HID_LINK_BLINK_MS));
+        return;
+    }
+
     bool alive = link_last_frame_ms > 0 &&
                  (k_uptime_get() - link_last_frame_ms) < ESB_HID_LINK_ALIVE_MS;
 
@@ -165,10 +176,15 @@ static int esb_hid_rx_init(void) {
 #if ESB_HID_LINK_LED
     if (gpio_is_ready_dt(&link_led)) {
         gpio_pin_configure_dt(&link_led, GPIO_OUTPUT_INACTIVE);
+        gpio_pin_configure_dt(&link_led_red, GPIO_OUTPUT_INACTIVE);
         k_work_schedule(&link_blink_work, K_MSEC(ESB_HID_LINK_BLINK_MS));
     }
 #endif
-    return esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
+    int err = esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
+#if ESB_HID_LINK_LED
+    rx_init_failed = err != 0;
+#endif
+    return err;
 }
 
 /* After the USB HID init (CONFIG_ZMK_USB_HID_INIT_PRIORITY=95) so early

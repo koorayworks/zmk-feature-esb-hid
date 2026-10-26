@@ -78,20 +78,30 @@ static void diag_boot_blink(void) {
 }
 
 static volatile bool diag_event_seen;
+static volatile bool diag_init_failed;
 
 static void diag_alive(struct k_work *work) {
+    static bool on;
+
+    on = !on;
+    if (diag_init_failed) {
+        /* esb_init/link start failed: fast red blink, distinct from
+         * every other state. */
+        gpio_pin_set_dt(&diag_led_red, on ? 1 : 0);
+        k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(150));
+        return;
+    }
     if (diag_event_seen) {
         gpio_pin_set_dt(&diag_led_green, 0);
         return;
     }
-    static bool on;
-
-    on = !on;
     gpio_pin_set_dt(&diag_led_green, on ? 1 : 0);
     k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(300));
 }
 
 static K_WORK_DELAYABLE_DEFINE(diag_alive_work, diag_alive);
+
+static void diag_note_init(int err) { diag_init_failed = err != 0; }
 
 static void diag_tx_event(enum esb_evt_id evt_id) {
     diag_event_seen = true;
@@ -104,6 +114,7 @@ static void diag_tx_event(enum esb_evt_id evt_id) {
 #else
 #define ESB_HID_TX_DIAG_LED 0
 static void diag_boot_blink(void) {}
+static void diag_note_init(int err) { ARG_UNUSED(err); }
 static void diag_tx_event(enum esb_evt_id evt_id) { ARG_UNUSED(evt_id); }
 #endif
 
@@ -292,6 +303,7 @@ K_THREAD_DEFINE(esb_hid_tx_thread, 1024, tx_thread, NULL, NULL, NULL, K_PRIO_PRE
 
 static int esb_hid_tx_init(void) {
     int err = esb_hid_link_start(ESB_MODE_PTX, esb_hid_tx_event_handler);
+    diag_note_init(err);
     if (err) {
         return err;
     }
