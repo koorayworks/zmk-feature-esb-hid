@@ -332,6 +332,7 @@ static void link_retry(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(link_retry_work, link_retry);
 
 static void link_retry(struct k_work *work) {
+    LOG_INF("esb_hid: TX link start attempt (ESBHID-3)");
     int err = esb_hid_link_start(ESB_MODE_PTX, esb_hid_tx_event_handler);
 
     diag_note_init(err);
@@ -346,19 +347,11 @@ static void link_retry(struct k_work *work) {
 }
 
 static int esb_hid_tx_init(void) {
-    int err = esb_hid_link_start(ESB_MODE_PTX, esb_hid_tx_event_handler);
-    diag_note_init(err);
-    if (err) {
-        LOG_ERR("ESB link start failed: %d (retry in 5s)", err);
-        k_work_schedule(&link_retry_work, K_SECONDS(5));
-        return 0;
-    }
-
-    link_ready = true;
-
-    /* First status frame shortly after boot, then as a heartbeat. */
-    k_work_schedule(&status_work, K_SECONDS(1));
-
+    /* First attempt is deferred 6 s: a SYS_INIT-time attempt logs
+     * before the USB CDC console is attached, so its error (the only
+     * one that shows the original failure) would be lost. */
+    LOG_INF("esb_hid: TX init, first link start in 6s (ESBHID-3)");
+    k_work_schedule(&link_retry_work, K_SECONDS(6));
     return 0;
 }
 

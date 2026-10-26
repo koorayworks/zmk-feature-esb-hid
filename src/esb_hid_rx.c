@@ -193,6 +193,7 @@ static void rx_link_retry(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(rx_link_retry_work, rx_link_retry);
 
 static void rx_link_retry(struct k_work *work) {
+    LOG_INF("esb_hid: RX link start attempt (ESBHID-3)");
     int err = esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
 
 #if ESB_HID_LINK_LED
@@ -212,15 +213,10 @@ static int esb_hid_rx_init(void) {
         k_work_schedule(&link_blink_work, K_MSEC(ESB_HID_LINK_BLINK_MS));
     }
 #endif
-    int err = esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
-#if ESB_HID_LINK_LED
-    rx_init_err = err;
-#endif
-    if (err) {
-        LOG_ERR("ESB RX link start failed: %d (retry in 5s)", err);
-        k_work_schedule(&rx_link_retry_work, K_SECONDS(5));
-        return 0;
-    }
+    /* First attempt deferred 6 s, same reason as TX: don't lose the
+     * original error to the not-yet-attached USB console. */
+    LOG_INF("esb_hid: RX init, first link start in 6s (ESBHID-3)");
+    k_work_schedule(&rx_link_retry_work, K_SECONDS(6));
     return 0;
 }
 
