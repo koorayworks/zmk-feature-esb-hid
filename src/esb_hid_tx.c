@@ -77,7 +77,24 @@ static void diag_boot_blink(void) {
     }
 }
 
+static volatile bool diag_event_seen;
+
+static void diag_alive(struct k_work *work) {
+    if (diag_event_seen) {
+        gpio_pin_set_dt(&diag_led_green, 0);
+        return;
+    }
+    static bool on;
+
+    on = !on;
+    gpio_pin_set_dt(&diag_led_green, on ? 1 : 0);
+    k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(300));
+}
+
+static K_WORK_DELAYABLE_DEFINE(diag_alive_work, diag_alive);
+
 static void diag_tx_event(enum esb_evt_id evt_id) {
+    diag_event_seen = true;
     if (evt_id == ESB_EVENT_TX_SUCCESS) {
         diag_pulse(&diag_led_blue, &diag_blue_work);
     } else if (evt_id == ESB_EVENT_TX_FAILED) {
@@ -242,6 +259,11 @@ static void tx_thread(void) {
     struct esb_hid_frame frame;
 
     diag_boot_blink();
+#if ESB_HID_TX_DIAG_LED
+    /* Keep blinking slowly until the first TX event, so "module alive
+     * but radio silent" stays visible for as long as it lasts. */
+    k_work_schedule(&diag_alive_work, K_MSEC(300));
+#endif
 
     while (1) {
         if (k_msgq_get(&esb_hid_tx_queue, &frame, K_MSEC(20)) == 0) {
