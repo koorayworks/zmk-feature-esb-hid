@@ -31,7 +31,7 @@ static const uint8_t report_ids[ESB_HID_TYPE_COUNT] = {
     ZMK_HID_REPORT_ID_MOUSE,
 };
 
-static void esb_event_handler(const struct esb_evt *evt) {
+static void esb_hid_rx_event_handler(const struct esb_evt *evt) {
     if (evt->evt_id == ESB_EVENT_RX_RECEIVED) {
         k_sem_give(&rx_sem);
     }
@@ -82,7 +82,7 @@ static void rx_thread(void) {
 K_THREAD_DEFINE(esb_hid_rx_thread, 1024, rx_thread, NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, 0);
 
 static int esb_hid_rx_init(void) {
-    return esb_hid_link_start(ESB_MODE_PRX, esb_event_handler);
+    return esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
 }
 
 SYS_INIT(esb_hid_rx_init, APPLICATION, 95);

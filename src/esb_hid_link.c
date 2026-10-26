@@ -18,7 +18,7 @@ static const uint8_t base_address_1[4] = {0xC2, 0xC2, 0xC2, 0xC2};
 static const uint8_t pipe_prefixes[8] = {0xE7, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8};
 
 int esb_hid_link_start(enum esb_mode mode, esb_event_handler handler) {
-    struct esb_config config = ESB_DEFAULT_CONFIG();
+    struct esb_config config = ESB_DEFAULT_CONFIG;
 
     config.mode = mode;
     config.event_handler = handler;

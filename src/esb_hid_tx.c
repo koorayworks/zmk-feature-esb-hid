@@ -44,7 +44,7 @@ static volatile bool resync_consumer;
 static K_SEM_DEFINE(tx_done_sem, 0, 1);
 static volatile bool tx_last_ok;
 
-static void esb_event_handler(const struct esb_evt *evt) {
+static void esb_hid_tx_event_handler(const struct esb_evt *evt) {
     switch (evt->evt_id) {
     case ESB_EVENT_TX_SUCCESS:
         tx_last_ok = true;
@@ -155,7 +155,7 @@ static void tx_thread(void) {
 K_THREAD_DEFINE(esb_hid_tx_thread, 1024, tx_thread, NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, 0);
 
 static int esb_hid_tx_init(void) {
-    int err = esb_hid_link_start(ESB_MODE_PTX, esb_event_handler);
+    int err = esb_hid_link_start(ESB_MODE_PTX, esb_hid_tx_event_handler);
     if (err) {
         return err;
     }

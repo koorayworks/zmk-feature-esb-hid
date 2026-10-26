@@ -101,7 +101,13 @@ extern "C" {
 	NRFX_CONCAT_2(NRF_TIMER, ESB_TIMER_INSTANCE_NO)
 
 /** ESB nrfx timer instance. */
-#define ESB_NRFX_TIMER_INSTANCE_REG NRF_TIMER_INST_GET(ESB_TIMER_INSTANCE_NO)
+/* Plain-Zephyr note: upstream NCS pairs this ESB version with a newer
+ * nrfx whose NRFX_TIMER_INSTANCE() accepts the register token produced
+ * by NRF_TIMER_INST_GET(). Zephyr 4.1's bundled nrfx instead takes the
+ * numeric instance id in NRFX_TIMER_INSTANCE(), which is exactly
+ * ESB_TIMER_INSTANCE_NO; the resulting nrfx_timer_t is identical.
+ */
+#define ESB_NRFX_TIMER_INSTANCE_REG ESB_TIMER_INSTANCE_NO
 
 /** ESB EGU events and tasks configuration. */
 #define ESB_EGU_EVENT NRF_EGU_EVENT_TRIGGERED6
