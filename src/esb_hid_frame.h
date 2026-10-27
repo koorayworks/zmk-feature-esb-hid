@@ -17,7 +17,17 @@
 #define ESB_HID_TYPE_CONSUMER 1
 #define ESB_HID_TYPE_MOUSE 2
 #define ESB_HID_TYPE_STATUS 3
-#define ESB_HID_TYPE_COUNT 4
+/* Studio RPC stream fragments (bidirectional). Body is a raw chunk of
+ * the framed ZMK Studio RPC byte stream (SOF/EOF/ESC framing is part of
+ * the stream, so fragments may split at any byte). Uplink (TX->RX)
+ * frames travel like other reports; downlink (RX->TX) fragments travel
+ * as ESB ACK payloads with this same frame format. */
+#define ESB_HID_TYPE_STUDIO 4
+/* Empty poll frame (TX->RX, no body). Exists only to give the receiver
+ * a packet to attach a pending ACK payload to, so downlink Studio data
+ * can be pulled without waiting for user input. */
+#define ESB_HID_TYPE_POLL 5
+#define ESB_HID_TYPE_COUNT 6
 
 #define ESB_HID_FRAME_HDR_LEN 2
 

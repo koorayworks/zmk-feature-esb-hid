@@ -19,6 +19,7 @@
 
 #include "esb_hid_frame.h"
 #include "esb_hid_link.h"
+#include "esb_hid_studio.h"
 
 LOG_MODULE_DECLARE(esb_hid);
 
@@ -63,7 +64,7 @@ static void handle_status(const uint8_t *data, size_t len) {
 static uint8_t last_seq[ESB_HID_TYPE_COUNT];
 static bool seq_valid[ESB_HID_TYPE_COUNT];
 
-static const uint8_t report_ids[ESB_HID_TYPE_COUNT] = {
+static const uint8_t report_ids[] = {
     ZMK_HID_REPORT_ID_KEYBOARD,
     ZMK_HID_REPORT_ID_CONSUMER,
     ZMK_HID_REPORT_ID_MOUSE,
@@ -131,6 +132,11 @@ static void link_led_note_frame(void) {}
 static void esb_hid_rx_event_handler(const struct esb_evt *evt) {
     if (evt->evt_id == ESB_EVENT_RX_RECEIVED) {
         k_sem_give(&rx_sem);
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
+        /* Receiving a packet consumed one queued ACK payload; the
+         * Studio forwarder may be able to load the next fragment. */
+        esb_hid_studio_fwd_note_link_event();
+#endif
     }
 }
 
@@ -158,6 +164,21 @@ static void handle_payload(const struct esb_payload *payload) {
     }
 
     link_led_note_frame();
+
+    if (type == ESB_HID_TYPE_STUDIO) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
+        esb_hid_studio_fwd_to_pc(&payload->data[ESB_HID_FRAME_HDR_LEN],
+                                 payload->length - ESB_HID_FRAME_HDR_LEN);
+#endif
+        return;
+    }
+
+    if (type == ESB_HID_TYPE_POLL) {
+        /* Polls exist only to pull ACK payloads; nothing to forward.
+         * (The ACK refill itself is triggered from the RX event
+         * handler, which fires for polls as well.) */
+        return;
+    }
 
     if (type == ESB_HID_TYPE_STATUS) {
         handle_status(&payload->data[ESB_HID_FRAME_HDR_LEN],

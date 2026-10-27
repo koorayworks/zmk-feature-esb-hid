@@ -12,6 +12,14 @@ if(CONFIG_ZMK_ESB_HID)
   target_sources(app PRIVATE src/esb_hid_tx.c)
 endif()
 
+if(CONFIG_ZMK_ESB_HID_STUDIO)
+  target_sources(app PRIVATE src/esb_hid_studio_tx.c)
+endif()
+
 if(CONFIG_ZMK_ESB_HID_RECEIVER)
   target_sources(app PRIVATE src/esb_hid_rx.c)
+endif()
+
+if(CONFIG_ZMK_ESB_HID_STUDIO_RX)
+  target_sources(app PRIVATE src/esb_hid_studio_rx.c)
 endif()

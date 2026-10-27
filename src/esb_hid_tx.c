@@ -31,6 +31,7 @@
 
 #include "esb_hid_frame.h"
 #include "esb_hid_link.h"
+#include "esb_hid_studio.h"
 
 LOG_MODULE_DECLARE(esb_hid);
 
@@ -175,6 +176,60 @@ static void esb_hid_tx_event_handler(const struct esb_evt *evt) {
     }
 }
 
+static int enqueue_report(uint8_t type, const uint8_t *body, size_t len);
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
+/* ------------------------------------------------------------------ */
+/* Studio over ESB (downlink via ACK payloads + polling)               */
+
+/* Poll pacing: while a Studio session is active (fragments seen in
+ * either direction within the window) poll fast so ACK payloads are
+ * pulled with low latency; otherwise poll slowly so an idle keyboard
+ * still notices a pending Studio request within about a second
+ * without burning battery on constant traffic. */
+#define ESB_HID_STUDIO_POLL_FAST_MS 20
+#define ESB_HID_STUDIO_POLL_SLOW_MS 1000
+#define ESB_HID_STUDIO_ACTIVE_WINDOW_MS 5000
+
+static volatile int64_t studio_last_activity_ms;
+static int64_t studio_last_poll_ms;
+
+static void studio_note_activity(void) { studio_last_activity_ms = k_uptime_get(); }
+
+int esb_hid_tx_enqueue_studio(const uint8_t *data, size_t len) {
+    studio_note_activity();
+    return enqueue_report(ESB_HID_TYPE_STUDIO, data, len);
+}
+
+/* Drain any pending ACK payloads. Called from the TX thread (never
+ * from the ESB event handler, whose context is not safe for this). */
+static void studio_drain_ack_payloads(void) {
+    struct esb_payload payload;
+
+    while (esb_read_rx_payload(&payload) == 0) {
+        if (payload.length > ESB_HID_FRAME_HDR_LEN &&
+            payload.data[0] == ESB_HID_TYPE_STUDIO) {
+            studio_note_activity();
+            esb_hid_studio_on_rx_bytes(&payload.data[ESB_HID_FRAME_HDR_LEN],
+                                       payload.length - ESB_HID_FRAME_HDR_LEN);
+        } else {
+            LOG_DBG("Ignoring non-studio ACK payload (len %d)", payload.length);
+        }
+    }
+}
+
+static void studio_maybe_poll(void) {
+    int64_t now = k_uptime_get();
+    bool active = (now - studio_last_activity_ms) < ESB_HID_STUDIO_ACTIVE_WINDOW_MS;
+    int64_t interval = active ? ESB_HID_STUDIO_POLL_FAST_MS : ESB_HID_STUDIO_POLL_SLOW_MS;
+
+    if (now - studio_last_poll_ms >= interval) {
+        studio_last_poll_ms = now;
+        enqueue_report(ESB_HID_TYPE_POLL, NULL, 0);
+    }
+}
+#endif /* IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO) */
+
 static int enqueue_report(uint8_t type, const uint8_t *body, size_t len) {
     if (len + ESB_HID_FRAME_HDR_LEN > CONFIG_ESB_MAX_PAYLOAD_LENGTH) {
         return -EMSGSIZE;
@@ -185,7 +240,9 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len) {
         .seq = seqs[type]++,
         .len = (uint8_t)len,
     };
-    memcpy(frame.body, body, len);
+    if (len > 0) {
+        memcpy(frame.body, body, len);
+    }
 
     if (k_msgq_put(&esb_hid_tx_queue, &frame, K_NO_WAIT) != 0) {
         if (type == ESB_HID_TYPE_KEYBOARD) {
@@ -273,7 +330,10 @@ static void send_frame(const struct esb_hid_frame *frame) {
     payload.data[1] = frame->seq;
     memcpy(&payload.data[ESB_HID_FRAME_HDR_LEN], frame->body, frame->len);
 
-    int attempts = (frame->type == ESB_HID_TYPE_MOUSE) ? 1 : 3;
+    /* Mouse and poll frames are disposable: a single attempt each.
+     * Polls in particular must not stall the queue behind retries,
+     * the next poll goes out one interval later anyway. */
+    int attempts = (frame->type == ESB_HID_TYPE_MOUSE || frame->type == ESB_HID_TYPE_POLL) ? 1 : 3;
     for (int i = 0; i < attempts; i++) {
         tx_last_ok = false;
         k_sem_reset(&tx_done_sem);
@@ -303,8 +363,19 @@ static void tx_thread(void) {
     while (1) {
         if (k_msgq_get(&esb_hid_tx_queue, &frame, K_MSEC(20)) == 0) {
             send_frame(&frame);
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
+            /* A successful send may have carried an ACK payload. */
+            studio_drain_ack_payloads();
+#endif
             continue;
         }
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
+        studio_drain_ack_payloads();
+        if (link_ready) {
+            studio_maybe_poll();
+        }
+#endif
 
         /* Queue drained: re-send current absolute-state reports if any
          * frame had to be dropped earlier. */

@@ -14,6 +14,28 @@ config ZMK_ESB_HID
 	  ZMK_ESB_HID_RECEIVER enabled. Requires the ZMK fork hooks
 	  (ZMK_TRANSPORT_ESB in endpoints).
 
+config ZMK_ESB_HID_STUDIO
+	bool "ZMK Studio RPC over ESB (keyboard side)"
+	depends on ZMK_ESB_HID
+	depends on ZMK_STUDIO
+	help
+	  Register a Studio RPC transport bound to the ESB endpoint, so
+	  ZMK Studio can edit this keyboard's keymap through the ESB
+	  receiver's USB CDC forwarder. Studio stream fragments travel as
+	  ESB_HID_TYPE_STUDIO frames; downlink fragments are pulled via
+	  ESB ACK payloads, provoked by periodic poll frames from the
+	  keyboard (fast while a session is active, slow when idle).
+
+config ZMK_ESB_HID_STUDIO_RX
+	bool "ZMK Studio over ESB forwarder (receiver side)"
+	depends on ZMK_ESB_HID_RECEIVER
+	help
+	  Forward Studio RPC bytes between a second USB CDC ACM port
+	  (devicetree node "esb_studio_cdc") and the ESB link: downlink
+	  bytes are queued as ESB ACK payloads, uplink
+	  ESB_HID_TYPE_STUDIO frames are written out to the CDC port.
+	  Requires the shield to provide the esb_studio_cdc node.
+
 config ZMK_ESB_HID_RECEIVER
 	bool "HID over ESB receiver (ESB to USB HID)"
 	depends on SOC_SERIES_NRF52X || SOC_SERIES_NRF53X || SOC_SERIES_NRF54LX
