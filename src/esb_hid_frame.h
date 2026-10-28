@@ -47,6 +47,18 @@
  * payloads, pending downlink fragments). */
 #define ESB_HID_STATUS_FLAG_BOOT 0x01
 
+/* Selected HID output transport of the keyboard, in flags bits 2:1.
+ * Status frames travel over ESB regardless of the selected output, so
+ * this is how the receiver (e.g. the Deck display) can tell whether
+ * the keyboard's keystrokes currently reach the host through this
+ * receiver (ESB) or directly (USB cable / BLE). Keyboards with older
+ * firmware send 0 = ESB, which is correct for those ESB-only builds.
+ * Receivers with older firmware simply ignore these bits. */
+#define ESB_HID_STATUS_FLAG_OUTPUT_SHIFT 1
+#define ESB_HID_STATUS_FLAG_OUTPUT_MASK (0x03 << ESB_HID_STATUS_FLAG_OUTPUT_SHIFT)
+/* Field values: ESB_HID_STATUS_OUTPUT_* in <esb_hid_status.h> (kept in
+ * the public header because display code compares against them). */
+
 #define ESB_HID_FRAME_HDR_LEN 2
 
 /* Status frame body (type ESB_HID_TYPE_STATUS).

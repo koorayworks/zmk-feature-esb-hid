@@ -11,10 +11,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Values of the output-transport field in the status frame flags
+ * (bits 2:1, see esb_hid_frame.h): which transport the keyboard's HID
+ * output is currently selected to. Status frames always travel over
+ * ESB, so this is the only way to know whether keystrokes reach the
+ * host through the receiver or directly. */
+#define ESB_HID_STATUS_OUTPUT_ESB 0
+#define ESB_HID_STATUS_OUTPUT_USB 1
+#define ESB_HID_STATUS_OUTPUT_BLE 2
+#define ESB_HID_STATUS_OUTPUT_NONE 3
+
 struct esb_hid_device_status {
     uint8_t battery; /* 0-100 %, 0xFF = unknown */
     uint8_t layer;
     uint8_t flags;
+    uint8_t output; /* ESB_HID_STATUS_OUTPUT_* decoded from flags */
     uint8_t proto_version;
     int64_t last_update_ms; /* k_uptime_get() of the last status frame */
     bool valid;

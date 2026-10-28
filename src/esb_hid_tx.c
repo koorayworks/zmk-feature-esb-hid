@@ -20,11 +20,13 @@
 #include <string.h>
 
 #include <esb.h>
+#include <esb_hid_status.h>
 #include <zmk/battery.h>
 #include <zmk/endpoints.h>
 #include <zmk/esb_hid.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/battery_state_changed.h>
+#include <zmk/events/endpoint_changed.h>
 #include <zmk/events/layer_state_changed.h>
 #include <zmk/hid.h>
 #include <zmk/keymap.h>
@@ -305,11 +307,36 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len) {
  * status frame is itself retried by send_frame(). */
 static uint8_t status_boot_countdown = 3;
 
+/* Encode the currently selected HID output transport into the status
+ * flags field. Status frames are sent over ESB no matter which output
+ * is selected, so without this the receiver cannot tell that e.g. the
+ * user toggled `&out` to USB and the keystrokes now bypass it. */
+static uint8_t status_output_flags(void) {
+    uint8_t output;
+
+    switch (zmk_endpoint_get_selected().transport) {
+    case ZMK_TRANSPORT_USB:
+        output = ESB_HID_STATUS_OUTPUT_USB;
+        break;
+    case ZMK_TRANSPORT_BLE:
+        output = ESB_HID_STATUS_OUTPUT_BLE;
+        break;
+    case ZMK_TRANSPORT_ESB:
+        output = ESB_HID_STATUS_OUTPUT_ESB;
+        break;
+    default:
+        output = ESB_HID_STATUS_OUTPUT_NONE;
+        break;
+    }
+    return (uint8_t)(output << ESB_HID_STATUS_FLAG_OUTPUT_SHIFT);
+}
+
 static void send_status_snapshot(void) {
     struct esb_hid_status_body body = {
         .battery = ESB_HID_BATTERY_UNKNOWN,
         .layer = (uint8_t)zmk_keymap_highest_layer_active(),
-        .flags = (status_boot_countdown > 0) ? ESB_HID_STATUS_FLAG_BOOT : 0,
+        .flags = (uint8_t)(((status_boot_countdown > 0) ? ESB_HID_STATUS_FLAG_BOOT : 0) |
+                           status_output_flags()),
         .proto_version = ESB_HID_PROTOCOL_VERSION,
     };
 
@@ -343,11 +370,19 @@ static int esb_hid_tx_listener(const zmk_event_t *eh) {
         send_status_snapshot();
         return 0;
     }
+    if (as_zmk_endpoint_changed(eh) != NULL) {
+        /* The selected output transport changed (e.g. `&out OUT_TOG`):
+         * push a snapshot now so the receiver's display follows the
+         * toggle immediately instead of at the next heartbeat. */
+        send_status_snapshot();
+        return 0;
+    }
     return 0;
 }
 
 ZMK_LISTENER(esb_hid_tx, esb_hid_tx_listener);
 ZMK_SUBSCRIPTION(esb_hid_tx, zmk_layer_state_changed);
+ZMK_SUBSCRIPTION(esb_hid_tx, zmk_endpoint_changed);
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
 ZMK_SUBSCRIPTION(esb_hid_tx, zmk_battery_state_changed);
 #endif

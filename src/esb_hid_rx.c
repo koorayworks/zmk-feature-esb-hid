@@ -47,18 +47,23 @@ static void handle_status(const uint8_t *data, size_t len) {
 
     const struct esb_hid_status_body *body = (const struct esb_hid_status_body *)data;
 
+    uint8_t output = (uint8_t)((body->flags & ESB_HID_STATUS_FLAG_OUTPUT_MASK) >>
+                               ESB_HID_STATUS_FLAG_OUTPUT_SHIFT);
+
     if (!device_status.valid || device_status.battery != body->battery ||
-        device_status.layer != body->layer) {
+        device_status.layer != body->layer || device_status.output != output) {
         if (body->battery == ESB_HID_BATTERY_UNKNOWN) {
-            LOG_INF("Peer status: battery unknown, layer %d", body->layer);
+            LOG_INF("Peer status: battery unknown, layer %d, output %d", body->layer, output);
         } else {
-            LOG_INF("Peer status: battery %d%%, layer %d", body->battery, body->layer);
+            LOG_INF("Peer status: battery %d%%, layer %d, output %d", body->battery, body->layer,
+                    output);
         }
     }
 
     device_status.battery = body->battery;
     device_status.layer = body->layer;
     device_status.flags = body->flags;
+    device_status.output = output;
     device_status.proto_version = body->proto_version;
     device_status.last_update_ms = k_uptime_get();
     device_status.valid = true;
