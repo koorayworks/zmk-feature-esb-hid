@@ -27,7 +27,18 @@
  * a packet to attach a pending ACK payload to, so downlink Studio data
  * can be pulled without waiting for user input. */
 #define ESB_HID_TYPE_POLL 5
-#define ESB_HID_TYPE_COUNT 6
+/* Studio session hint (RX->TX, ACK payloads only, never a regular
+ * uplink frame). Body is a single flags byte; lets the receiver tell
+ * the keyboard "a Studio client is connected / downlink data is
+ * waiting" on the ACK of whatever traffic the keyboard already sends,
+ * so the keyboard only starts polling once a session actually exists.
+ * See esb_hid_studio_rx.c (producer) and esb_hid_tx.c (consumer). */
+#define ESB_HID_TYPE_STUDIO_HINT 6
+#define ESB_HID_TYPE_COUNT 7
+
+/* Studio hint flags (body[0] of ESB_HID_TYPE_STUDIO_HINT). */
+#define ESB_HID_STUDIO_HINT_CONNECTED 0x01
+#define ESB_HID_STUDIO_HINT_DOWNLINK_PENDING 0x02
 
 #define ESB_HID_FRAME_HDR_LEN 2
 

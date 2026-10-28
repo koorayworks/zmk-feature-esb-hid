@@ -182,16 +182,29 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len);
 /* ------------------------------------------------------------------ */
 /* Studio over ESB (downlink via ACK payloads + polling)               */
 
-/* Poll pacing: while a Studio session is active (fragments seen in
- * either direction within the window) poll fast so ACK payloads are
- * pulled with low latency; otherwise poll slowly so an idle keyboard
- * still notices a pending Studio request within about a second
- * without burning battery on constant traffic. */
+/* Detection-based poll pacing. The keyboard never polls on a timer
+ * while no Studio session exists: the receiver piggybacks a
+ * ESB_HID_TYPE_STUDIO_HINT on the ACK of whatever traffic the keyboard
+ * sends anyway (key/mouse reports, the 30 s status heartbeat), and
+ * only a hint (or real Studio fragments) wakes the fast poll loop.
+ *
+ * Fast polling (20 ms) is maintained while
+ *  - a hint with DOWNLINK_PENDING was seen within the active window, or
+ *  - Studio fragments moved in either direction within the window.
+ * A hint that only says "connected" starts a short probe window: the
+ * Studio app sends its first request right after connecting, and the
+ * fragments for it sit in the receiver's ACK FIFO behind the hint, so
+ * a brief burst of polls pulls them in. Connected-only hints received
+ * on poll ACKs do NOT extend anything, otherwise an idle-but-open
+ * Studio window would keep the keyboard polling forever. Once all
+ * windows lapse, polling stops completely (zero self-originated
+ * traffic) until the next hint rides in on regular traffic. */
 #define ESB_HID_STUDIO_POLL_FAST_MS 20
-#define ESB_HID_STUDIO_POLL_SLOW_MS 1000
 #define ESB_HID_STUDIO_ACTIVE_WINDOW_MS 5000
+#define ESB_HID_STUDIO_PROBE_WINDOW_MS 1000
 
 static volatile int64_t studio_last_activity_ms;
+static volatile int64_t studio_probe_until_ms;
 static int64_t studio_last_poll_ms;
 
 static void studio_note_activity(void) { studio_last_activity_ms = k_uptime_get(); }
@@ -199,6 +212,20 @@ static void studio_note_activity(void) { studio_last_activity_ms = k_uptime_get(
 int esb_hid_tx_enqueue_studio(const uint8_t *data, size_t len) {
     studio_note_activity();
     return enqueue_report(ESB_HID_TYPE_STUDIO, data, len);
+}
+
+static void studio_handle_hint(uint8_t flags) {
+    if (flags & ESB_HID_STUDIO_HINT_DOWNLINK_PENDING) {
+        /* Real downlink data is queued at the receiver: treat like
+         * fragment activity so fast polling is sustained until the
+         * fragments themselves take over. */
+        studio_note_activity();
+    } else if (flags & ESB_HID_STUDIO_HINT_CONNECTED) {
+        /* Session exists but nothing queued (yet): probe briefly so a
+         * request the app sends right after connecting is pulled in
+         * without waiting for the next user keypress / heartbeat. */
+        studio_probe_until_ms = k_uptime_get() + ESB_HID_STUDIO_PROBE_WINDOW_MS;
+    }
 }
 
 /* Drain any pending ACK payloads. Called from the TX thread (never
@@ -212,6 +239,9 @@ static void studio_drain_ack_payloads(void) {
             studio_note_activity();
             esb_hid_studio_on_rx_bytes(&payload.data[ESB_HID_FRAME_HDR_LEN],
                                        payload.length - ESB_HID_FRAME_HDR_LEN);
+        } else if (payload.length > ESB_HID_FRAME_HDR_LEN &&
+                   payload.data[0] == ESB_HID_TYPE_STUDIO_HINT) {
+            studio_handle_hint(payload.data[ESB_HID_FRAME_HDR_LEN]);
         } else {
             LOG_DBG("Ignoring non-studio ACK payload (len %d)", payload.length);
         }
@@ -220,10 +250,16 @@ static void studio_drain_ack_payloads(void) {
 
 static void studio_maybe_poll(void) {
     int64_t now = k_uptime_get();
-    bool active = (now - studio_last_activity_ms) < ESB_HID_STUDIO_ACTIVE_WINDOW_MS;
-    int64_t interval = active ? ESB_HID_STUDIO_POLL_FAST_MS : ESB_HID_STUDIO_POLL_SLOW_MS;
+    bool active = (now - studio_last_activity_ms) < ESB_HID_STUDIO_ACTIVE_WINDOW_MS ||
+                  now < studio_probe_until_ms;
 
-    if (now - studio_last_poll_ms >= interval) {
+    if (!active) {
+        /* No session detected: stay silent. The next hint arrives on
+         * the ACK of regular traffic (keypress or 30 s heartbeat). */
+        return;
+    }
+
+    if (now - studio_last_poll_ms >= ESB_HID_STUDIO_POLL_FAST_MS) {
         studio_last_poll_ms = now;
         enqueue_report(ESB_HID_TYPE_POLL, NULL, 0);
     }

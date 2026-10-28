@@ -173,6 +173,13 @@ static void handle_payload(const struct esb_payload *payload) {
         return;
     }
 
+    if (type == ESB_HID_TYPE_STUDIO_HINT) {
+        /* Hints only ever travel as ACK payloads (RX->TX). One
+         * arriving as a regular uplink frame is a protocol error;
+         * never forward it to USB HID. */
+        return;
+    }
+
     if (type == ESB_HID_TYPE_POLL) {
         /* Polls exist only to pull ACK payloads; nothing to forward.
          * (The ACK refill itself is triggered from the RX event
