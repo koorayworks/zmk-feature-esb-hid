@@ -20,6 +20,14 @@
  *
  *   Keyboard -> ESB_HID_TYPE_STUDIO frames (handled in esb_hid_rx.c)
  *   -> esb_hid_studio_fwd_to_pc() -> message queue -> CDC out.
+ *
+ *   Session flush: state held for one keyboard boot / CDC session
+ *   must not leak into the next. When the keyboard reports a reboot
+ *   (status BOOT flag, see esb_hid_rx.c) or the CDC client goes away
+ *   (DTR drop), the pending downlink bytes, the uplink queue and the
+ *   ACK payloads queued in the radio are all dropped. The purge runs
+ *   in the ACK loader thread, which owns the downlink ring buffer
+ *   claims and is the only caller of esb_write_payload() here.
  */
 
 #include <zephyr/device.h>
@@ -84,17 +92,99 @@ void esb_hid_studio_fwd_note_link_event(void) {
     k_sem_give(&esb_studio_down_sem);
 }
 
-/* Is a Studio client attached to the CDC port? Web Serial asserts
- * DTR when the app opens the port. If the line state cannot be read
- * (driver without line-ctrl support), assume connected: hints are
- * cheap and the keyboard ignores them when no session follows. */
-static bool esb_studio_cdc_connected(void) {
+/* Read the CDC DTR line. Returns false when the line state cannot be
+ * read (driver without line-ctrl support); *connected is then unset. */
+static bool esb_studio_cdc_dtr(bool *connected) {
     uint32_t dtr = 0;
 
     if (uart_line_ctrl_get(cdc_dev, UART_LINE_CTRL_DTR, &dtr) != 0) {
+        return false;
+    }
+    *connected = dtr != 0;
+    return true;
+}
+
+/* Is a Studio client attached to the CDC port? Web Serial asserts
+ * DTR when the app opens the port. If the line state cannot be read,
+ * assume connected: hints are cheap and the keyboard ignores them
+ * when no session follows. */
+static bool esb_studio_cdc_connected(void) {
+    bool connected;
+
+    if (!esb_studio_cdc_dtr(&connected)) {
         return true;
     }
-    return dtr != 0;
+    return connected;
+}
+
+/* ------------------------------------------------------------------ */
+/* Session flush                                                       */
+
+/* Posted by esb_hid_studio_fwd_flush_session(); the purge itself runs
+ * in the ACK loader thread (see the file header). */
+static volatile bool flush_requested;
+
+void esb_hid_studio_fwd_flush_session(void) {
+    flush_requested = true;
+    k_sem_give(&esb_studio_down_sem);
+}
+
+/* Drop everything held for the current session. Loader thread only.
+ *
+ * The radio half needs care: esb_flush_tx() only runs while the ESB
+ * state machine is IDLE, but a listening PRX sits in ESB_STATE_PRX,
+ * so the ACK payloads queued in the radio's TX FIFO are cleared by
+ * suspending RX first and restarting it right after. The gap is
+ * sub-millisecond; a frame lost in it is covered by the sender's
+ * retries / the status heartbeat. If RX was not listening (link not
+ * started yet), the FIFO is cleared while idle and starting RX stays
+ * with the link retry loop, as before. */
+static void esb_studio_do_flush(void) {
+    ring_buf_reset(&esb_studio_down_buf);
+    k_msgq_purge(&esb_studio_up_queue);
+    hint_replenish_armed = true;
+
+    int err = esb_stop_rx();
+
+    if (err == 0) {
+        err = esb_flush_tx();
+        if (err) {
+            LOG_WRN("Studio flush: esb_flush_tx failed: %d", err);
+        }
+        err = esb_start_rx();
+        if (err) {
+            LOG_ERR("Studio flush: esb_start_rx failed: %d", err);
+        }
+    } else if (err == -EALREADY) {
+        err = esb_flush_tx();
+        if (err) {
+            LOG_WRN("Studio flush: esb_flush_tx failed: %d", err);
+        }
+    } else {
+        LOG_DBG("Studio flush: radio untouched (esb_stop_rx: %d)", err);
+    }
+
+    LOG_INF("Studio session flushed");
+}
+
+/* Flush when the CDC client goes away: a readable DTR that drops
+ * from connected to not-connected. The unreadable case (fallback:
+ * assume connected) never flushes, it has no edge to detect. */
+static bool dtr_sample_valid;
+static bool dtr_was_connected;
+
+static void esb_studio_check_dtr_drop(void) {
+    bool connected;
+
+    if (!esb_studio_cdc_dtr(&connected)) {
+        return;
+    }
+    if (dtr_sample_valid && dtr_was_connected && !connected) {
+        LOG_INF("Studio client disconnected (DTR drop)");
+        esb_studio_do_flush();
+    }
+    dtr_sample_valid = true;
+    dtr_was_connected = connected;
 }
 
 static void esb_studio_maybe_load_hint(void) {
@@ -133,6 +223,12 @@ static void esb_studio_ack_loader_thread(void) {
 
     while (1) {
         k_sem_take(&esb_studio_down_sem, K_MSEC(100));
+
+        if (flush_requested) {
+            flush_requested = false;
+            esb_studio_do_flush();
+        }
+        esb_studio_check_dtr_drop();
 
         bool fifo_full = false;
 
@@ -236,5 +332,7 @@ void esb_hid_studio_fwd_to_pc(const uint8_t *data, size_t len) {
 }
 
 void esb_hid_studio_fwd_note_link_event(void) {}
+
+void esb_hid_studio_fwd_flush_session(void) {}
 
 #endif

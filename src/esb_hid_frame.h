@@ -40,6 +40,13 @@
 #define ESB_HID_STUDIO_HINT_CONNECTED 0x01
 #define ESB_HID_STUDIO_HINT_DOWNLINK_PENDING 0x02
 
+/* Status frame flags (esb_hid_status_body.flags). */
+/* Set by the keyboard in the first few status frames after boot, so
+ * the receiver can edge-detect a keyboard reboot and drop the stale
+ * Studio session state it holds for the previous boot (queued ACK
+ * payloads, pending downlink fragments). */
+#define ESB_HID_STATUS_FLAG_BOOT 0x01
+
 #define ESB_HID_FRAME_HDR_LEN 2
 
 /* Status frame body (type ESB_HID_TYPE_STATUS).
@@ -52,6 +59,6 @@
 struct esb_hid_status_body {
     uint8_t battery;       /* 0-100 %, ESB_HID_BATTERY_UNKNOWN if unavailable */
     uint8_t layer;         /* highest active layer index */
-    uint8_t flags;         /* reserved, send 0 */
+    uint8_t flags;         /* ESB_HID_STATUS_FLAG_* */
     uint8_t proto_version; /* ESB_HID_PROTOCOL_VERSION */
 };

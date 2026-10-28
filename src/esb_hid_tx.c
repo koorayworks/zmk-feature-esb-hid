@@ -297,13 +297,25 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len) {
 
 #define ESB_HID_STATUS_HEARTBEAT K_SECONDS(30)
 
+/* The first few status frames after boot carry ESB_HID_STATUS_FLAG_BOOT
+ * so the receiver can edge-detect this reboot and flush the Studio
+ * session state it holds for the previous boot. Snapshots fire on
+ * layer/battery events plus the 30 s heartbeat (the first at link
+ * start +1 s); 3 flagged sends are redundancy against loss, and every
+ * status frame is itself retried by send_frame(). */
+static uint8_t status_boot_countdown = 3;
+
 static void send_status_snapshot(void) {
     struct esb_hid_status_body body = {
         .battery = ESB_HID_BATTERY_UNKNOWN,
         .layer = (uint8_t)zmk_keymap_highest_layer_active(),
-        .flags = 0,
+        .flags = (status_boot_countdown > 0) ? ESB_HID_STATUS_FLAG_BOOT : 0,
         .proto_version = ESB_HID_PROTOCOL_VERSION,
     };
+
+    if (status_boot_countdown > 0) {
+        status_boot_countdown--;
+    }
 
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
     body.battery = zmk_battery_state_of_charge();

@@ -28,3 +28,11 @@ void esb_hid_studio_fwd_to_pc(const uint8_t *data, size_t len);
  * may just have been consumed), so queued downlink fragments should be
  * (re)loaded into the ESB ACK FIFO. */
 void esb_hid_studio_fwd_note_link_event(void);
+
+/* RX side: flush the Studio session state held for the current peer
+ * boot (pending downlink bytes, queued ACK payloads in the radio).
+ * Called when the keyboard signals a reboot via the status BOOT flag;
+ * the forwarder itself also flushes when the CDC client disconnects
+ * (DTR drop). The purge runs in the forwarder's loader thread, so this
+ * only posts the request. */
+void esb_hid_studio_fwd_flush_session(void);

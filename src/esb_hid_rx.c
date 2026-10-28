@@ -25,6 +25,9 @@ LOG_MODULE_DECLARE(esb_hid);
 
 static K_SEM_DEFINE(rx_sem, 0, K_SEM_MAX_LIMIT);
 
+static uint8_t last_seq[ESB_HID_TYPE_COUNT];
+static bool seq_valid[ESB_HID_TYPE_COUNT];
+
 /* Latest status frame per device. Step 1/2: only device 0 exists. */
 static struct esb_hid_device_status device_status;
 
@@ -59,10 +62,33 @@ static void handle_status(const uint8_t *data, size_t len) {
     device_status.proto_version = body->proto_version;
     device_status.last_update_ms = k_uptime_get();
     device_status.valid = true;
-}
 
-static uint8_t last_seq[ESB_HID_TYPE_COUNT];
-static bool seq_valid[ESB_HID_TYPE_COUNT];
+    /* Edge-detect the keyboard's BOOT flag: it is set for the first
+     * few status frames after a keyboard reboot and clear afterwards,
+     * so a set frame while armed means "new boot". The Studio session
+     * state held for the previous boot (queued ACK payloads, pending
+     * downlink fragments) is stale then and would poison the fresh
+     * session, so flush it. The duplicate suppression restarts too:
+     * the keyboard's seq counters restarted at 0, and a fresh frame
+     * whose seq happens to equal the stale last_seq must not be
+     * dropped as a duplicate. */
+    static bool status_boot_armed = true;
+
+    if (body->flags & ESB_HID_STATUS_FLAG_BOOT) {
+        if (status_boot_armed) {
+            status_boot_armed = false;
+            for (int i = 0; i < ESB_HID_TYPE_COUNT; i++) {
+                seq_valid[i] = false;
+            }
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
+            esb_hid_studio_fwd_flush_session();
+#endif
+            LOG_INF("Peer reboot detected, receiver session state flushed");
+        }
+    } else {
+        status_boot_armed = true;
+    }
+}
 
 static const uint8_t report_ids[] = {
     ZMK_HID_REPORT_ID_KEYBOARD,
