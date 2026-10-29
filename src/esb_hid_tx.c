@@ -187,7 +187,7 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len);
 /* Detection-based poll pacing. The keyboard never polls on a timer
  * while no Studio session exists: the receiver piggybacks a
  * ESB_HID_TYPE_STUDIO_HINT on the ACK of whatever traffic the keyboard
- * sends anyway (key/mouse reports, the 30 s status heartbeat), and
+ * sends anyway (key/mouse reports, the 5 s status heartbeat), and
  * only a hint (or real Studio fragments) wakes the fast poll loop.
  *
  * Fast polling (20 ms) is maintained while
@@ -257,7 +257,7 @@ static void studio_maybe_poll(void) {
 
     if (!active) {
         /* No session detected: stay silent. The next hint arrives on
-         * the ACK of regular traffic (keypress or 30 s heartbeat). */
+         * the ACK of regular traffic (keypress or 5 s heartbeat). */
         return;
     }
 
@@ -297,12 +297,12 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len) {
 /* ------------------------------------------------------------------ */
 /* Status frames (battery / layer)                                     */
 
-#define ESB_HID_STATUS_HEARTBEAT K_SECONDS(30)
+#define ESB_HID_STATUS_HEARTBEAT K_SECONDS(5)
 
 /* The first few status frames after boot carry ESB_HID_STATUS_FLAG_BOOT
  * so the receiver can edge-detect this reboot and flush the Studio
  * session state it holds for the previous boot. Snapshots fire on
- * layer/battery events plus the 30 s heartbeat (the first at link
+ * layer/battery events plus the 5 s heartbeat (the first at link
  * start +1 s); 3 flagged sends are redundancy against loss, and every
  * status frame is itself retried by send_frame(). */
 static uint8_t status_boot_countdown = 3;
