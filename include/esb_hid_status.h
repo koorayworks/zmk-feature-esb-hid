@@ -21,6 +21,11 @@
 #define ESB_HID_STATUS_OUTPUT_BLE 2
 #define ESB_HID_STATUS_OUTPUT_NONE 3
 
+/* A keyboard counts as lost when no frame of any type has been
+ * received from it for this long. The TX status heartbeat period is
+ * 30 s, so this leaves a small margin over one missed heartbeat. */
+#define ESB_HID_LINK_LOST_TIMEOUT_MS 35000
+
 struct esb_hid_device_status {
     uint8_t battery; /* 0-100 %, 0xFF = unknown */
     uint8_t layer;
@@ -28,6 +33,7 @@ struct esb_hid_device_status {
     uint8_t output; /* ESB_HID_STATUS_OUTPUT_* decoded from flags */
     uint8_t proto_version;
     int64_t last_update_ms; /* k_uptime_get() of the last status frame */
+    int64_t last_seen_ms;   /* k_uptime_get() of the last frame of any type */
     bool valid;
 };
 

@@ -31,11 +31,17 @@ static bool seq_valid[ESB_HID_TYPE_COUNT];
 /* Latest status frame per device. Step 1/2: only device 0 exists. */
 static struct esb_hid_device_status device_status;
 
+/* Arrival time of the most recent accepted frame of any type. Any
+ * frame proves the keyboard is alive, so this advances much more
+ * often than the status-only last_update_ms while the user types. */
+static int64_t last_frame_ms;
+
 bool esb_hid_get_device_status(uint8_t device_index, struct esb_hid_device_status *out) {
     if (device_index != 0 || !device_status.valid) {
         return false;
     }
     *out = device_status;
+    out->last_seen_ms = last_frame_ms;
     return true;
 }
 
@@ -194,6 +200,7 @@ static void handle_payload(const struct esb_payload *payload) {
         last_seq[type] = seq;
     }
 
+    last_frame_ms = k_uptime_get();
     link_led_note_frame();
 
     if (type == ESB_HID_TYPE_STUDIO) {
