@@ -12,7 +12,7 @@ split のポジション情報を送る方式ではないため、キーボー�
 
 Step 1（実験段階）: 固定アドレス・暗号化なし・1対1。
 **未ビルド検証**。ビルドには対応するフックを持つ ZMK フォーク
-（`vwbugowner1976/zmk` の `esb-hid` ブランチ）が必要。
+（`koorayworks/zmk` の `esb-hid` ブランチ）が必要。
 
 ## 使い方
 
@@ -28,7 +28,7 @@ west manifest にモジュールを追加し、ボード設定で有効化する
     CONFIG_ZMK_ESB_HID_RECEIVER=y
     CONFIG_ESB_MAX_PAYLOAD_LENGTH=64
 
-テスト用 config: `vwbugowner1976/zmk-config-esb-hid-test`
+テスト用 config: `koorayworks/zmk-config-esb-hid-test`
 
 ## ワイヤ形式
 
