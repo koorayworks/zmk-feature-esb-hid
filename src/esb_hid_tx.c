@@ -422,6 +422,16 @@ static void send_frame(const struct esb_hid_frame *frame) {
         k_sem_reset(&tx_done_sem);
 
         int err = esb_write_payload(&payload);
+        if (err == -ENOMEM) {
+            /* Defensive: with the pop on failure below, the TX FIFO
+             * should never fill up. If it still does, drop the queued
+             * payloads instead of wedging the link for good: every
+             * frame carries absolute state, so the current frame
+             * supersedes anything queued. */
+            while (esb_pop_tx() == 0) {
+            }
+            err = esb_write_payload(&payload);
+        }
         if (err) {
             LOG_WRN("esb_write_payload failed: %d", err);
             return;
@@ -429,6 +439,17 @@ static void send_frame(const struct esb_hid_frame *frame) {
         if (k_sem_take(&tx_done_sem, K_MSEC(50)) == 0 && tx_last_ok) {
             return;
         }
+        /* The attempt failed (or timed out). The ESB library removes a
+         * payload from the TX FIFO only on TX success; a failed one
+         * stays at the FIFO head and every retry queues behind it, so
+         * with the receiver away the FIFO fills up and all later
+         * writes return -ENOMEM even after the receiver is back --
+         * the link then only recovers by rebooting the keyboard.
+         * Drop the failed head payload: the retry below (or the next
+         * frame) carries newer state anyway. On a bare timeout the
+         * pop may return -EBUSY while the radio is still busy; the
+         * failure event that follows is handled by the next attempt. */
+        esb_pop_tx();
     }
     LOG_WRN("ESB TX failed (type %d)", frame->type);
 }
