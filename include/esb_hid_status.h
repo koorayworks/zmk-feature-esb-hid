@@ -33,6 +33,10 @@
 #define ESB_HID_NAME_MAX 16
 #endif
 
+/* Maximum layer name length in characters (excluding the NUL).
+ * Carried in status v3 frames after the device name trailer. */
+#define ESB_HID_LAYER_NAME_MAX 16
+
 struct esb_hid_device_status {
     uint8_t battery; /* 0-100 %, 0xFF = unknown */
     uint8_t layer;
@@ -40,6 +44,7 @@ struct esb_hid_device_status {
     uint8_t output; /* ESB_HID_STATUS_OUTPUT_* decoded from flags */
     uint8_t proto_version;
     char name[ESB_HID_NAME_MAX + 1]; /* from status v2 frames; "" for v1 peers */
+    char layer_name[ESB_HID_LAYER_NAME_MAX + 1]; /* from status v3 frames; "" for v1/v2 peers */
     int64_t last_update_ms;         /* k_uptime_get() of the last status frame */
     int64_t last_seen_ms;           /* k_uptime_get() of the last frame of any type */
     bool valid;

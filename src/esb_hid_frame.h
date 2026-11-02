@@ -34,10 +34,19 @@
  * so the keyboard only starts polling once a session actually exists.
  * See esb_hid_studio_rx.c (producer) and esb_hid_tx.c (consumer). */
 #define ESB_HID_TYPE_STUDIO_HINT 6
-/* Pairing request (TX->RX, pairing pipe 7 only). Body:
- *   [0] pairing protocol version (ESB_HID_PAIR_PROTO_VERSION)
+/* Pairing request (TX->RX, pairing pipe 7 only).
+ * Proto v1 body:
+ *   [0] pairing protocol version (=1)
  *   [1] name_len
  *   [2..] device name bytes (CONFIG_ZMK_ESB_HID_DEVICE_NAME, <=16)
+ * Proto v2 body:
+ *   [0] pairing protocol version (=2, ESB_HID_PAIR_PROTO_VERSION)
+ *   [1] id_len (<= ESB_HID_DEVICE_ID_LEN)
+ *   [2..2+id_len) hardware device ID bytes
+ *   [2+id_len] name_len
+ *   [3+id_len..] device name bytes (<=16)
+ * Receivers accept both v1 (candidate id_len = 0) and v2; other
+ * versions are ignored.
  * Sent repeatedly (~every 500 ms) by a keyboard in pairing mode until
  * it adopts an assigned slot or the 30 s pairing window lapses. */
 #define ESB_HID_TYPE_PAIR_REQUEST 7
@@ -52,8 +61,12 @@
 #define ESB_HID_TYPE_PAIR_ASSIGN 8
 #define ESB_HID_TYPE_COUNT 9
 
-#define ESB_HID_PAIR_PROTO_VERSION 1
+#define ESB_HID_PAIR_PROTO_VERSION 2
 #define ESB_HID_PAIR_SLOT_NOT_YET 0xFF
+
+/* Length of the hardware device ID carried in pairing proto v2.
+ * Source is Zephyr hwinfo (nRF FICR DEVICEID = exactly 8 bytes). */
+#define ESB_HID_DEVICE_ID_LEN 8
 
 /* Studio hint flags (body[0] of ESB_HID_TYPE_STUDIO_HINT). */
 #define ESB_HID_STUDIO_HINT_CONNECTED 0x01
@@ -90,8 +103,13 @@
  * CONFIG_ZMK_ESB_HID_DEVICE_NAME truncated to ESB_HID_NAME_MAX chars.
  * Receivers parse the trailer only when proto_version >= 2 and the
  * frame is long enough; v1 frames (exactly 4 body bytes) are still
- * accepted with an empty name. */
-#define ESB_HID_PROTOCOL_VERSION 2
+ * accepted with an empty name.
+ * Status protocol v3: proto_version = 3 and a layer-name trailer
+ * appended after the v2 name trailer:
+ * [layer_name_len][layer_name bytes], layer name truncated to
+ * ESB_HID_LAYER_NAME_MAX bytes. v1/v2 frames are still accepted,
+ * with an empty layer name. */
+#define ESB_HID_PROTOCOL_VERSION 3
 
 struct esb_hid_status_body {
     uint8_t battery;       /* 0-100 %, ESB_HID_BATTERY_UNKNOWN if unavailable */

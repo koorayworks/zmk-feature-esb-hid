@@ -26,6 +26,7 @@
 struct esb_hid_slot_info {
     bool used;
     char name[ESB_HID_NAME_MAX + 1];
+    char layer_name[ESB_HID_LAYER_NAME_MAX + 1];
     bool status_valid;
     uint8_t battery; /* 0-100, 0xFF = unknown */
     uint8_t layer;

@@ -51,17 +51,50 @@ struct esb_hid_registry {
     uint8_t active_slot;
     struct {
         uint8_t used;
+        uint8_t dev_id[ESB_HID_DEVICE_ID_LEN];
         char name[ESB_HID_NAME_MAX + 1];
     } slots[ESB_HID_SLOT_COUNT];
 };
 
+/* On-disk registry formats (explicit; the RAM struct above is not
+ * the disk layout). v1 = 73 bytes, v2 = 106 bytes. */
+struct esb_hid_registry_disk_v1 {
+    uint8_t active_slot;
+    struct {
+        uint8_t used;
+        char name[ESB_HID_NAME_MAX + 1];
+    } slots[ESB_HID_SLOT_COUNT];
+};
+
+struct esb_hid_registry_disk_v2 {
+    uint8_t version; /* = 2 */
+    uint8_t active_slot;
+    struct {
+        uint8_t used;
+        uint8_t dev_id[ESB_HID_DEVICE_ID_LEN];
+        char name[ESB_HID_NAME_MAX + 1];
+    } slots[ESB_HID_SLOT_COUNT];
+};
+
+BUILD_ASSERT(sizeof(struct esb_hid_registry_disk_v1) == 73, "registry disk v1 must be 73 bytes");
+BUILD_ASSERT(sizeof(struct esb_hid_registry_disk_v2) == 106, "registry disk v2 must be 106 bytes");
+
 static struct esb_hid_registry registry;
 static bool registry_from_settings;
 static bool registry_loaded;
+static bool registry_migrated;
 
 static void registry_save(void) {
 #if IS_ENABLED(CONFIG_SETTINGS)
-    int err = settings_save_one("esb_hid/registry", &registry, sizeof(registry));
+    struct esb_hid_registry_disk_v2 disk = {.version = 2, .active_slot = registry.active_slot};
+
+    for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+        disk.slots[i].used = registry.slots[i].used;
+        memcpy(disk.slots[i].dev_id, registry.slots[i].dev_id, ESB_HID_DEVICE_ID_LEN);
+        memcpy(disk.slots[i].name, registry.slots[i].name, ESB_HID_NAME_MAX + 1);
+    }
+
+    int err = settings_save_one("esb_hid/registry", &disk, sizeof(disk));
 
     if (err) {
         LOG_ERR("Failed to save ESB registry: %d", err);
@@ -75,16 +108,43 @@ static int esb_hid_rx_settings_set(const char *name, size_t len, settings_read_c
     const char *next;
 
     if (settings_name_steq(name, "registry", &next) && !next) {
-        if (len != sizeof(registry)) {
-            return -EINVAL;
-        }
-        int rc = read_cb(cb_arg, &registry, sizeof(registry));
+        if (len == sizeof(struct esb_hid_registry_disk_v1)) {
+            struct esb_hid_registry_disk_v1 disk;
+            int rc = read_cb(cb_arg, &disk, sizeof(disk));
 
-        if (rc >= 0) {
+            if (rc < 0) {
+                return rc;
+            }
+            registry.active_slot = disk.active_slot;
+            for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+                registry.slots[i].used = disk.slots[i].used;
+                memset(registry.slots[i].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
+                memcpy(registry.slots[i].name, disk.slots[i].name, ESB_HID_NAME_MAX + 1);
+            }
+            registry_from_settings = true;
+            registry_migrated = true;
+            return 0;
+        }
+        if (len == sizeof(struct esb_hid_registry_disk_v2)) {
+            struct esb_hid_registry_disk_v2 disk;
+            int rc = read_cb(cb_arg, &disk, sizeof(disk));
+
+            if (rc < 0) {
+                return rc;
+            }
+            if (disk.version != 2) {
+                return -EINVAL;
+            }
+            registry.active_slot = disk.active_slot;
+            for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+                registry.slots[i].used = disk.slots[i].used;
+                memcpy(registry.slots[i].dev_id, disk.slots[i].dev_id, ESB_HID_DEVICE_ID_LEN);
+                memcpy(registry.slots[i].name, disk.slots[i].name, ESB_HID_NAME_MAX + 1);
+            }
             registry_from_settings = true;
             return 0;
         }
-        return rc;
+        return -EINVAL;
     }
     return -ENOENT;
 }
@@ -118,6 +178,7 @@ static void registry_load_once(void) {
         registry.active_slot = 0;
         for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
             registry.slots[i].used = (i < 3) ? 1 : 0;
+            memset(registry.slots[i].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
             strncpy(registry.slots[i].name, default_names[i], ESB_HID_NAME_MAX);
             registry.slots[i].name[ESB_HID_NAME_MAX] = '\0';
         }
@@ -126,6 +187,11 @@ static void registry_load_once(void) {
 
     if (registry.active_slot >= ESB_HID_SLOT_COUNT) {
         registry.active_slot = 0;
+    }
+
+    if (registry_migrated && registry_from_settings) {
+        LOG_INF("ESB registry: migrated v1 registry to v2, saving");
+        registry_save();
     }
     LOG_INF("ESB registry: active slot %d, used [%d %d %d %d]", registry.active_slot,
             registry.slots[0].used, registry.slots[1].used, registry.slots[2].used,
@@ -191,6 +257,8 @@ static struct {
     enum esb_hid_pairing_state state;
     uint8_t target_slot;
     char candidate_name[ESB_HID_NAME_MAX + 1];
+    uint8_t candidate_id[ESB_HID_DEVICE_ID_LEN];
+    uint8_t candidate_id_len;
     int64_t deadline_ms;
     int64_t last_request_ms;
     int64_t assigning_since_ms;
@@ -236,6 +304,45 @@ static void pairing_finalize(void) {
     registry.slots[pairing.target_slot].used = 1;
     strncpy(registry.slots[pairing.target_slot].name, pairing.candidate_name, ESB_HID_NAME_MAX);
     registry.slots[pairing.target_slot].name[ESB_HID_NAME_MAX] = '\0';
+    memset(registry.slots[pairing.target_slot].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
+    if (pairing.candidate_id_len > 0) {
+        memcpy(registry.slots[pairing.target_slot].dev_id, pairing.candidate_id,
+               pairing.candidate_id_len);
+    }
+
+    /* Clear any duplicate registration of the same device in other
+     * slots: same hardware ID when both sides have one, otherwise
+     * same name. */
+    for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+        if (i == pairing.target_slot || !registry.slots[i].used) {
+            continue;
+        }
+        bool stored_id_nonzero = false;
+
+        for (int j = 0; j < ESB_HID_DEVICE_ID_LEN; j++) {
+            if (registry.slots[i].dev_id[j] != 0) {
+                stored_id_nonzero = true;
+                break;
+            }
+        }
+        bool id_match_possible = pairing.candidate_id_len > 0 && stored_id_nonzero;
+        bool duplicate = id_match_possible
+                             ? (memcmp(registry.slots[i].dev_id, pairing.candidate_id,
+                                       ESB_HID_DEVICE_ID_LEN) == 0)
+                             : (strcmp(registry.slots[i].name, pairing.candidate_name) == 0);
+
+        if (duplicate) {
+            LOG_INF("Registry: \"%s\" moved slot %d -> %d (duplicate cleared)",
+                    pairing.candidate_name, i, pairing.target_slot);
+            registry.slots[i].used = 0;
+            registry.slots[i].name[0] = '\0';
+            memset(registry.slots[i].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
+            if (registry.active_slot == i && registry.active_slot != pairing.target_slot) {
+                registry.active_slot = pairing.target_slot;
+            }
+        }
+    }
+
     registry_save();
     pairing.state = ESB_HID_PAIRING_DONE;
     LOG_INF("Pairing: slot %d registered to \"%s\"", pairing.target_slot, pairing.candidate_name);
@@ -266,6 +373,8 @@ static void pairing_timer_handler(struct k_work *work) {
         LOG_INF("Pairing: window timed out, back to idle");
         pairing.state = ESB_HID_PAIRING_IDLE;
         pairing.candidate_name[0] = '\0';
+        memset(pairing.candidate_id, 0, ESB_HID_DEVICE_ID_LEN);
+        pairing.candidate_id_len = 0;
         k_mutex_unlock(&esb_hid_rx_mutex);
         return;
     }
@@ -280,7 +389,28 @@ static void pairing_on_request(const uint8_t *body, size_t len) {
     if (len < 2) {
         return;
     }
-    if (body[0] != ESB_HID_PAIR_PROTO_VERSION) {
+
+    /* Parse per proto version with strict length validation.
+     * v1: [proto=1][name_len][name], candidate id_len = 0.
+     * v2: [proto=2][id_len][id bytes][name_len][name]. */
+    uint8_t candidate_id[ESB_HID_DEVICE_ID_LEN] = {0};
+    uint8_t candidate_id_len = 0;
+    size_t name_offset;
+
+    if (body[0] == 1) {
+        name_offset = 2;
+    } else if (body[0] == 2) {
+        candidate_id_len = body[1];
+        if (candidate_id_len > ESB_HID_DEVICE_ID_LEN) {
+            LOG_WRN("Pairing: ignoring request with id_len %d", candidate_id_len);
+            return;
+        }
+        if (len < (size_t)(2 + candidate_id_len + 1)) {
+            return;
+        }
+        memcpy(candidate_id, &body[2], candidate_id_len);
+        name_offset = 3 + candidate_id_len;
+    } else {
         LOG_WRN("Pairing: ignoring request with proto version %d", body[0]);
         return;
     }
@@ -291,10 +421,10 @@ static void pairing_on_request(const uint8_t *body, size_t len) {
         return;
     }
 
-    size_t name_len = body[1];
+    size_t name_len = body[name_offset - 1];
 
-    if (name_len > len - 2) {
-        name_len = len - 2;
+    if (name_len > len - name_offset) {
+        name_len = len - name_offset;
     }
     if (name_len > ESB_HID_NAME_MAX) {
         name_len = ESB_HID_NAME_MAX;
@@ -304,7 +434,10 @@ static void pairing_on_request(const uint8_t *body, size_t len) {
 
     if (pairing.state == ESB_HID_PAIRING_SEARCHING ||
         pairing.state == ESB_HID_PAIRING_CANDIDATE) {
-        memcpy(pairing.candidate_name, &body[2], name_len);
+        memset(pairing.candidate_id, 0, ESB_HID_DEVICE_ID_LEN);
+        memcpy(pairing.candidate_id, candidate_id, candidate_id_len);
+        pairing.candidate_id_len = candidate_id_len;
+        memcpy(pairing.candidate_name, &body[name_offset], name_len);
         pairing.candidate_name[name_len] = '\0';
         if (pairing.state == ESB_HID_PAIRING_SEARCHING) {
             pairing.state = ESB_HID_PAIRING_CANDIDATE;
@@ -334,6 +467,8 @@ int esb_hid_pairing_open(uint8_t target_slot) {
     pairing.state = ESB_HID_PAIRING_SEARCHING;
     pairing.target_slot = target_slot;
     pairing.candidate_name[0] = '\0';
+    memset(pairing.candidate_id, 0, ESB_HID_DEVICE_ID_LEN);
+    pairing.candidate_id_len = 0;
     pairing.deadline_ms = k_uptime_get() + ESB_HID_PAIRING_WINDOW_MS;
     pairing.last_request_ms = 0;
     pairing_load_payload(ESB_HID_PAIR_SLOT_NOT_YET, NULL);
@@ -384,6 +519,8 @@ void esb_hid_pairing_cancel(void) {
     k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
     pairing.state = ESB_HID_PAIRING_IDLE;
     pairing.candidate_name[0] = '\0';
+    memset(pairing.candidate_id, 0, ESB_HID_DEVICE_ID_LEN);
+    pairing.candidate_id_len = 0;
     k_work_cancel_delayable(&pairing_timer_work);
     k_mutex_unlock(&esb_hid_rx_mutex);
     LOG_INF("Pairing: cancelled");
@@ -481,6 +618,12 @@ int esb_hid_rx_get_slot_info(uint8_t slot, struct esb_hid_slot_info *out) {
         strncpy(out->name, peers[slot].status.name, ESB_HID_NAME_MAX);
         out->name[ESB_HID_NAME_MAX] = '\0';
     }
+    if (peers[slot].status.valid) {
+        strncpy(out->layer_name, peers[slot].status.layer_name, ESB_HID_LAYER_NAME_MAX);
+        out->layer_name[ESB_HID_LAYER_NAME_MAX] = '\0';
+    } else {
+        out->layer_name[0] = '\0';
+    }
     out->status_valid = peers[slot].status.valid;
     out->battery = peers[slot].status.valid ? peers[slot].status.battery : 0xFF;
     out->layer = peers[slot].status.layer;
@@ -506,6 +649,7 @@ int esb_hid_rx_delete_slot(uint8_t slot) {
     k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
     registry.slots[slot].used = 0;
     registry.slots[slot].name[0] = '\0';
+    memset(registry.slots[slot].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
     registry_save();
     LOG_INF("ESB registry: slot %d deleted", slot);
     k_mutex_unlock(&esb_hid_rx_mutex);
@@ -527,11 +671,16 @@ static void handle_status(uint8_t slot, const uint8_t *data, size_t len) {
     uint8_t output = (uint8_t)((body->flags & ESB_HID_STATUS_FLAG_OUTPUT_MASK) >>
                                ESB_HID_STATUS_FLAG_OUTPUT_SHIFT);
 
-    /* Status v2 name trailer: [name_len][name] after the fixed body. */
+    /* Status v2 name trailer: [name_len][name] after the fixed body.
+     * Status v3 layer-name trailer: [layer_name_len][layer_name]
+     * after the v2 name trailer. */
     char name[ESB_HID_NAME_MAX + 1] = "";
+    char layer_name[ESB_HID_LAYER_NAME_MAX + 1] = "";
+    size_t trailer_offset = sizeof(struct esb_hid_status_body);
 
     if (body->proto_version >= 2 && len > sizeof(struct esb_hid_status_body)) {
-        size_t name_len = data[sizeof(struct esb_hid_status_body)];
+        size_t wire_name_len = data[sizeof(struct esb_hid_status_body)];
+        size_t name_len = wire_name_len;
 
         if (name_len > len - sizeof(struct esb_hid_status_body) - 1) {
             name_len = len - sizeof(struct esb_hid_status_body) - 1;
@@ -541,11 +690,29 @@ static void handle_status(uint8_t slot, const uint8_t *data, size_t len) {
         }
         memcpy(name, &data[sizeof(struct esb_hid_status_body) + 1], name_len);
         name[name_len] = '\0';
+        trailer_offset += 1 + wire_name_len;
+        if (trailer_offset > len) {
+            trailer_offset = len;
+        }
+    }
+
+    if (body->proto_version >= 3 && trailer_offset < len) {
+        size_t layer_name_len = data[trailer_offset];
+
+        if (layer_name_len > len - trailer_offset - 1) {
+            layer_name_len = len - trailer_offset - 1;
+        }
+        if (layer_name_len > ESB_HID_LAYER_NAME_MAX) {
+            layer_name_len = ESB_HID_LAYER_NAME_MAX;
+        }
+        memcpy(layer_name, &data[trailer_offset + 1], layer_name_len);
+        layer_name[layer_name_len] = '\0';
     }
 
     if (!peer->status.valid || peer->status.battery != body->battery ||
         peer->status.layer != body->layer || peer->status.output != output ||
-        strcmp(peer->status.name, name) != 0) {
+        strcmp(peer->status.name, name) != 0 ||
+        strcmp(peer->status.layer_name, layer_name) != 0) {
         if (body->battery == ESB_HID_BATTERY_UNKNOWN) {
             LOG_INF("Peer %d status: battery unknown, layer %d, output %d", slot, body->layer,
                     output);
@@ -562,6 +729,8 @@ static void handle_status(uint8_t slot, const uint8_t *data, size_t len) {
     peer->status.proto_version = body->proto_version;
     strncpy(peer->status.name, name, ESB_HID_NAME_MAX);
     peer->status.name[ESB_HID_NAME_MAX] = '\0';
+    strncpy(peer->status.layer_name, layer_name, ESB_HID_LAYER_NAME_MAX);
+    peer->status.layer_name[ESB_HID_LAYER_NAME_MAX] = '\0';
     peer->status.last_update_ms = k_uptime_get();
     peer->status.valid = true;
 

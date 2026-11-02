@@ -8,6 +8,7 @@ config ZMK_ESB_HID
 	depends on SOC_SERIES_NRF52X || SOC_SERIES_NRF53X || SOC_SERIES_NRF54LX
 	select ESB
 	select ESB_CLOCK_INIT
+	select HWINFO
 	select SETTINGS
 	# NVS needs FLASH + FLASH_PAGE_LAYOUT; select it only where the
 	# board provides them (e.g. the xiao_ble//zmk variant), so plain

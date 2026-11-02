@@ -13,6 +13,7 @@
  */
 
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
@@ -444,16 +445,32 @@ static void send_status_snapshot(void) {
 #endif
 
     /* Status v2: append the [name_len][name] trailer after the fixed
-     * 4-byte v1 body. */
-    uint8_t frame_body[sizeof(body) + 1 + ESB_HID_NAME_MAX];
+     * 4-byte v1 body. Status v3: append the [layer_name_len]
+     * [layer_name] trailer after the v2 name trailer. Layer names
+     * are ASCII display-names, so truncating to
+     * ESB_HID_LAYER_NAME_MAX bytes is fine.
+     * Frame buffer sizing: 4 + 1+16 + 1+16 = 38 body bytes max. */
+    uint8_t frame_body[sizeof(body) + 1 + ESB_HID_NAME_MAX + 1 + ESB_HID_LAYER_NAME_MAX];
     char name[ESB_HID_NAME_MAX + 1];
     size_t name_len = own_name(name);
+
+    const char *layer_name_str = zmk_keymap_layer_name(body.layer);
+    size_t layer_name_len = (layer_name_str != NULL) ? strlen(layer_name_str) : 0;
+
+    if (layer_name_len > ESB_HID_LAYER_NAME_MAX) {
+        layer_name_len = ESB_HID_LAYER_NAME_MAX;
+    }
 
     memcpy(frame_body, &body, sizeof(body));
     frame_body[sizeof(body)] = (uint8_t)name_len;
     memcpy(&frame_body[sizeof(body) + 1], name, name_len);
+    frame_body[sizeof(body) + 1 + name_len] = (uint8_t)layer_name_len;
+    if (layer_name_len > 0) {
+        memcpy(&frame_body[sizeof(body) + 1 + name_len + 1], layer_name_str, layer_name_len);
+    }
 
-    enqueue_report(ESB_HID_TYPE_STATUS, frame_body, sizeof(body) + 1 + name_len);
+    enqueue_report(ESB_HID_TYPE_STATUS, frame_body,
+                   sizeof(body) + 1 + name_len + 1 + layer_name_len);
 }
 
 static void status_heartbeat(struct k_work *work) {
@@ -501,6 +518,29 @@ ZMK_SUBSCRIPTION(esb_hid_tx, zmk_battery_state_changed);
 
 static int64_t pairing_deadline_ms;
 
+/* Hardware device ID (Zephyr hwinfo, nRF FICR DEVICEID), fetched
+ * lazily on first use and cached. device_id_len is the number of
+ * valid bytes (0 when the fetch failed / has not succeeded). */
+static uint8_t device_id[ESB_HID_DEVICE_ID_LEN];
+static uint8_t device_id_len;
+static bool device_id_fetched;
+
+static uint8_t fetch_device_id(void) {
+    if (!device_id_fetched) {
+        device_id_fetched = true;
+        ssize_t ret = hwinfo_get_device_id(device_id, sizeof(device_id));
+
+        if (ret < 1) {
+            device_id_len = 0;
+        } else {
+            device_id_len = (uint8_t)((size_t)ret > ESB_HID_DEVICE_ID_LEN
+                                          ? ESB_HID_DEVICE_ID_LEN
+                                          : (size_t)ret);
+        }
+    }
+    return device_id_len;
+}
+
 static void pairing_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(pairing_work, pairing_work_handler);
 
@@ -524,12 +564,25 @@ static void pairing_work_handler(struct k_work *work) {
 
     char name[ESB_HID_NAME_MAX + 1];
     size_t name_len = own_name(name);
-    uint8_t body[2 + ESB_HID_NAME_MAX];
+    uint8_t id_len = fetch_device_id();
+    uint8_t body[3 + ESB_HID_DEVICE_ID_LEN + ESB_HID_NAME_MAX];
+    size_t body_len;
 
-    body[0] = ESB_HID_PAIR_PROTO_VERSION;
-    body[1] = (uint8_t)name_len;
-    memcpy(&body[2], name, name_len);
-    enqueue_report(ESB_HID_TYPE_PAIR_REQUEST, body, 2 + name_len);
+    if (id_len < 1) {
+        /* No hardware ID available: fall back to the proto 1 body. */
+        body[0] = 1;
+        body[1] = (uint8_t)name_len;
+        memcpy(&body[2], name, name_len);
+        body_len = 2 + name_len;
+    } else {
+        body[0] = ESB_HID_PAIR_PROTO_VERSION;
+        body[1] = id_len;
+        memcpy(&body[2], device_id, id_len);
+        body[2 + id_len] = (uint8_t)name_len;
+        memcpy(&body[3 + id_len], name, name_len);
+        body_len = 3 + id_len + name_len;
+    }
+    enqueue_report(ESB_HID_TYPE_PAIR_REQUEST, body, body_len);
 
     k_work_reschedule(&pairing_work, K_MSEC(ESB_HID_PAIRING_REQUEST_PERIOD_MS));
 }
@@ -594,8 +647,22 @@ int esb_hid_tx_start_pairing(void) {
     char name[ESB_HID_NAME_MAX + 1];
 
     own_name(name);
-    LOG_INF("Pairing: started (name \"%s\"), requesting on pipe %d for 30 s", name,
-            ESB_HID_PAIRING_PIPE);
+    uint8_t id_len = fetch_device_id();
+
+    if (id_len > 0) {
+        char id_hex[ESB_HID_DEVICE_ID_LEN * 2 + 1];
+
+        for (int i = 0; i < id_len; i++) {
+            id_hex[i * 2] = "0123456789abcdef"[device_id[i] >> 4];
+            id_hex[i * 2 + 1] = "0123456789abcdef"[device_id[i] & 0x0F];
+        }
+        id_hex[id_len * 2] = '\0';
+        LOG_INF("Pairing: started (name \"%s\", device ID %s), requesting on pipe %d for 30 s",
+                name, id_hex, ESB_HID_PAIRING_PIPE);
+    } else {
+        LOG_INF("Pairing: started (name \"%s\"), requesting on pipe %d for 30 s", name,
+                ESB_HID_PAIRING_PIPE);
+    }
     return 0;
 }
 
