@@ -1,17 +1,31 @@
 /*
- * HID over ESB receiver.
+ * HID over ESB receiver (step 2: up to 4 keyboards + pairing).
  *
  * Runs on a matrix-less ZMK build connected to the host over USB.
- * Received [type][seq][body] frames are forwarded to USB HID through
- * the fork's zmk_usb_hid_send_report_with_id() hook, which prepends
- * the matching report ID so the wire bytes are identical to a locally
- * generated report.
+ * Received [type][seq][body] frames are attributed to a device slot
+ * by the ESB pipe they arrived on (pipes 0..3 = slots 0..3, pipe 7 =
+ * pairing). Only frames from the active, registry-used slot are
+ * forwarded to USB HID through the fork's
+ * zmk_usb_hid_send_report_with_id() hook; other slots only update
+ * their per-slot state (status, last-seen, cached HID bodies), so
+ * switching the active slot can release the old device's keys and
+ * re-inject the new device's held keys.
+ *
+ * The slot registry (which slots are paired, their names, the active
+ * slot) is persisted in settings under "esb_hid/registry". The
+ * pairing window state machine lives here too; its public API is in
+ * <esb_hid.h>.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/settings/settings.h>
+
+#include <errno.h>
+#include <string.h>
 
 #include <esb.h>
+#include <esb_hid.h>
 #include <esb_hid_status.h>
 #include <zephyr/drivers/gpio.h>
 #include <zmk/hid.h>
@@ -25,81 +39,360 @@ LOG_MODULE_DECLARE(esb_hid);
 
 static K_SEM_DEFINE(rx_sem, 0, K_SEM_MAX_LIMIT);
 
-static uint8_t last_seq[ESB_HID_TYPE_COUNT];
-static bool seq_valid[ESB_HID_TYPE_COUNT];
+/* Guards the registry, the per-slot peer state and the pairing state
+ * against concurrent access from the RX thread, the pairing timer
+ * and UI threads calling the public API. */
+static K_MUTEX_DEFINE(esb_hid_rx_mutex);
 
-/* Latest status frame per device. Step 1/2: only device 0 exists. */
-static struct esb_hid_device_status device_status;
+/* ------------------------------------------------------------------ */
+/* Slot registry (persisted)                                           */
 
-/* Arrival time of the most recent accepted frame of any type. Any
- * frame proves the keyboard is alive, so this advances much more
- * often than the status-only last_update_ms while the user types. */
-static int64_t last_frame_ms;
+struct esb_hid_registry {
+    uint8_t active_slot;
+    struct {
+        uint8_t used;
+        char name[ESB_HID_NAME_MAX + 1];
+    } slots[ESB_HID_SLOT_COUNT];
+};
+
+static struct esb_hid_registry registry;
+static bool registry_from_settings;
+static bool registry_loaded;
+
+static void registry_save(void) {
+#if IS_ENABLED(CONFIG_SETTINGS)
+    int err = settings_save_one("esb_hid/registry", &registry, sizeof(registry));
+
+    if (err) {
+        LOG_ERR("Failed to save ESB registry: %d", err);
+    }
+#endif
+}
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+static int esb_hid_rx_settings_set(const char *name, size_t len, settings_read_cb read_cb,
+                                   void *cb_arg) {
+    const char *next;
+
+    if (settings_name_steq(name, "registry", &next) && !next) {
+        if (len != sizeof(registry)) {
+            return -EINVAL;
+        }
+        int rc = read_cb(cb_arg, &registry, sizeof(registry));
+
+        if (rc >= 0) {
+            registry_from_settings = true;
+            return 0;
+        }
+        return rc;
+    }
+    return -ENOENT;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(esb_hid_rx, "esb_hid", NULL, esb_hid_rx_settings_set, NULL, NULL);
+#endif /* IS_ENABLED(CONFIG_SETTINGS) */
+
+/* Load the registry (or seed the step-2 defaults) once, from the
+ * deferred link-start path, before any frame is attributed. */
+static void registry_load_once(void) {
+    if (registry_loaded) {
+        return;
+    }
+    registry_loaded = true;
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+    /* ZMK's main() already ran settings_load() once; load our subtree
+     * again here so the values are in place even if that ordering
+     * ever changes. */
+    settings_load_subtree("esb_hid");
+#endif
+
+    if (!registry_from_settings) {
+        static const char *const default_names[ESB_HID_SLOT_COUNT] = {
+            "TentAlice",
+            "Nickey",
+            "koZakura",
+            "",
+        };
+
+        registry.active_slot = 0;
+        for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+            registry.slots[i].used = (i < 3) ? 1 : 0;
+            strncpy(registry.slots[i].name, default_names[i], ESB_HID_NAME_MAX);
+            registry.slots[i].name[ESB_HID_NAME_MAX] = '\0';
+        }
+        LOG_INF("ESB registry: no saved registry, seeded defaults");
+    }
+
+    if (registry.active_slot >= ESB_HID_SLOT_COUNT) {
+        registry.active_slot = 0;
+    }
+    LOG_INF("ESB registry: active slot %d, used [%d %d %d %d]", registry.active_slot,
+            registry.slots[0].used, registry.slots[1].used, registry.slots[2].used,
+            registry.slots[3].used);
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-slot peer state                                                 */
+
+#define ESB_HID_CACHE_BODY_MAX (CONFIG_ESB_MAX_PAYLOAD_LENGTH - ESB_HID_FRAME_HDR_LEN)
+
+struct esb_hid_peer {
+    struct esb_hid_device_status status;
+    int64_t last_seen_ms; /* k_uptime_get() of last frame of any type; 0 = never */
+    bool boot_armed;      /* BOOT-flag edge detection for the Studio flush */
+    /* Last HID body per report type (keyboard/consumer/mouse), for
+     * slot switching: release the old slot, re-inject the new one. */
+    struct {
+        uint8_t len;
+        uint8_t body[ESB_HID_CACHE_BODY_MAX];
+        bool valid;
+    } hid_cache[3];
+};
+
+static struct esb_hid_peer peers[ESB_HID_SLOT_COUNT];
+
+/* Duplicate suppression, per pipe and frame type. Indexed by pipe so
+ * the pairing pipe (7) gets its own row; pipes 4..6 are never enabled
+ * but keep a row for safety. */
+static uint8_t last_seq[8][ESB_HID_TYPE_COUNT];
+static bool seq_valid[8][ESB_HID_TYPE_COUNT];
 
 bool esb_hid_get_device_status(uint8_t device_index, struct esb_hid_device_status *out) {
-    if (device_index != 0 || !device_status.valid) {
+    if (device_index >= ESB_HID_SLOT_COUNT) {
         return false;
     }
-    *out = device_status;
-    out->last_seen_ms = last_frame_ms;
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    if (!peers[device_index].status.valid) {
+        k_mutex_unlock(&esb_hid_rx_mutex);
+        return false;
+    }
+    *out = peers[device_index].status;
+    out->last_seen_ms = peers[device_index].last_seen_ms;
+    k_mutex_unlock(&esb_hid_rx_mutex);
     return true;
 }
 
-static void handle_status(const uint8_t *data, size_t len) {
-    if (len != sizeof(struct esb_hid_status_body)) {
-        LOG_WRN("Malformed status frame (len %d)", (int)len);
+uint8_t esb_hid_rx_studio_pipe(void) { return registry.active_slot; }
+
+/* ------------------------------------------------------------------ */
+/* Pairing window (receiver side)                                      */
+
+#define ESB_HID_PAIRING_WINDOW_MS 60000
+/* While ASSIGNING, the keyboard adopts the slot and stops sending
+ * PAIR_REQUESTs; this much silence means it adopted. */
+#define ESB_HID_PAIRING_ASSIGN_QUIET_MS 2000
+/* Requests still arriving this long after confirm mean the keyboard
+ * did not adopt (e.g. name mismatch): fall back to CANDIDATE. */
+#define ESB_HID_PAIRING_ASSIGN_GIVEUP_MS 10000
+#define ESB_HID_PAIRING_TIMER_PERIOD_MS 250
+
+static struct {
+    enum esb_hid_pairing_state state;
+    uint8_t target_slot;
+    char candidate_name[ESB_HID_NAME_MAX + 1];
+    int64_t deadline_ms;
+    int64_t last_request_ms;
+    int64_t assigning_since_ms;
+    uint8_t seq;
+} pairing;
+
+static void pairing_timer_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(pairing_timer_work, pairing_timer_handler);
+
+/* Queue one PAIR_ASSIGN ACK payload on the pairing pipe. The ESB
+ * stack keeps ACK payloads in a per-pipe FIFO and attaches the head
+ * to the ACK of the next packet received on that pipe, so exactly one
+ * fresh payload is loaded after each pairing-pipe reception (the
+ * previous one was consumed by it). Callers hold esb_hid_rx_mutex. */
+static void pairing_load_payload(uint8_t slot, const char *name) {
+    size_t name_len = (name != NULL) ? strlen(name) : 0;
+
+    if (name_len > ESB_HID_NAME_MAX) {
+        name_len = ESB_HID_NAME_MAX;
+    }
+
+    struct esb_payload payload = {
+        .length = (uint8_t)(ESB_HID_FRAME_HDR_LEN + 2 + name_len),
+        .pipe = ESB_HID_PAIRING_PIPE,
+        .noack = 0,
+    };
+    payload.data[0] = ESB_HID_TYPE_PAIR_ASSIGN;
+    payload.data[1] = pairing.seq++;
+    payload.data[ESB_HID_FRAME_HDR_LEN] = slot;
+    payload.data[ESB_HID_FRAME_HDR_LEN + 1] = (uint8_t)name_len;
+    if (name_len > 0) {
+        memcpy(&payload.data[ESB_HID_FRAME_HDR_LEN + 2], name, name_len);
+    }
+
+    int err = esb_write_payload(&payload);
+
+    if (err) {
+        LOG_WRN("Pairing: failed to load ACK payload: %d", err);
+    }
+}
+
+static void pairing_finalize(void) {
+    registry.slots[pairing.target_slot].used = 1;
+    strncpy(registry.slots[pairing.target_slot].name, pairing.candidate_name, ESB_HID_NAME_MAX);
+    registry.slots[pairing.target_slot].name[ESB_HID_NAME_MAX] = '\0';
+    registry_save();
+    pairing.state = ESB_HID_PAIRING_DONE;
+    LOG_INF("Pairing: slot %d registered to \"%s\"", pairing.target_slot, pairing.candidate_name);
+}
+
+static void pairing_timer_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    if (pairing.state == ESB_HID_PAIRING_IDLE) {
+        k_mutex_unlock(&esb_hid_rx_mutex);
         return;
     }
 
-    const struct esb_hid_status_body *body = (const struct esb_hid_status_body *)data;
+    int64_t now = k_uptime_get();
 
-    uint8_t output = (uint8_t)((body->flags & ESB_HID_STATUS_FLAG_OUTPUT_MASK) >>
-                               ESB_HID_STATUS_FLAG_OUTPUT_SHIFT);
-
-    if (!device_status.valid || device_status.battery != body->battery ||
-        device_status.layer != body->layer || device_status.output != output) {
-        if (body->battery == ESB_HID_BATTERY_UNKNOWN) {
-            LOG_INF("Peer status: battery unknown, layer %d, output %d", body->layer, output);
-        } else {
-            LOG_INF("Peer status: battery %d%%, layer %d, output %d", body->battery, body->layer,
-                    output);
-        }
+    if (pairing.state == ESB_HID_PAIRING_ASSIGNING &&
+        now - pairing.last_request_ms > ESB_HID_PAIRING_ASSIGN_QUIET_MS) {
+        /* The keyboard stopped requesting: it adopted the slot. */
+        pairing_finalize();
+    } else if (pairing.state == ESB_HID_PAIRING_ASSIGNING &&
+               now - pairing.assigning_since_ms > ESB_HID_PAIRING_ASSIGN_GIVEUP_MS) {
+        LOG_WRN("Pairing: \"%s\" did not adopt slot %d, back to candidate",
+                pairing.candidate_name, pairing.target_slot);
+        pairing.state = ESB_HID_PAIRING_CANDIDATE;
+        pairing_load_payload(ESB_HID_PAIR_SLOT_NOT_YET, NULL);
+    } else if (pairing.state != ESB_HID_PAIRING_DONE && now >= pairing.deadline_ms) {
+        LOG_INF("Pairing: window timed out, back to idle");
+        pairing.state = ESB_HID_PAIRING_IDLE;
+        pairing.candidate_name[0] = '\0';
+        k_mutex_unlock(&esb_hid_rx_mutex);
+        return;
     }
 
-    device_status.battery = body->battery;
-    device_status.layer = body->layer;
-    device_status.flags = body->flags;
-    device_status.output = output;
-    device_status.proto_version = body->proto_version;
-    device_status.last_update_ms = k_uptime_get();
-    device_status.valid = true;
+    k_mutex_unlock(&esb_hid_rx_mutex);
+    k_work_reschedule(&pairing_timer_work, K_MSEC(ESB_HID_PAIRING_TIMER_PERIOD_MS));
+}
 
-    /* Edge-detect the keyboard's BOOT flag: it is set for the first
-     * few status frames after a keyboard reboot and clear afterwards,
-     * so a set frame while armed means "new boot". The Studio session
-     * state held for the previous boot (queued ACK payloads, pending
-     * downlink fragments) is stale then and would poison the fresh
-     * session, so flush it. The duplicate suppression restarts too:
-     * the keyboard's seq counters restarted at 0, and a fresh frame
-     * whose seq happens to equal the stale last_seq must not be
-     * dropped as a duplicate. */
-    static bool status_boot_armed = true;
+/* A PAIR_REQUEST arrived on the pairing pipe. Caller holds
+ * esb_hid_rx_mutex. */
+static void pairing_on_request(const uint8_t *body, size_t len) {
+    if (len < 2) {
+        return;
+    }
+    if (body[0] != ESB_HID_PAIR_PROTO_VERSION) {
+        LOG_WRN("Pairing: ignoring request with proto version %d", body[0]);
+        return;
+    }
+    if (pairing.state == ESB_HID_PAIRING_IDLE || pairing.state == ESB_HID_PAIRING_DONE) {
+        /* No window open: nothing to do (no ACK payload is queued
+         * for this pipe either, so the keyboard gets empty ACKs and
+         * gives up on its own after 30 s). */
+        return;
+    }
 
-    if (body->flags & ESB_HID_STATUS_FLAG_BOOT) {
-        if (status_boot_armed) {
-            status_boot_armed = false;
-            for (int i = 0; i < ESB_HID_TYPE_COUNT; i++) {
-                seq_valid[i] = false;
-            }
-#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
-            esb_hid_studio_fwd_flush_session();
-#endif
-            LOG_INF("Peer reboot detected, receiver session state flushed");
+    size_t name_len = body[1];
+
+    if (name_len > len - 2) {
+        name_len = len - 2;
+    }
+    if (name_len > ESB_HID_NAME_MAX) {
+        name_len = ESB_HID_NAME_MAX;
+    }
+
+    pairing.last_request_ms = k_uptime_get();
+
+    if (pairing.state == ESB_HID_PAIRING_SEARCHING ||
+        pairing.state == ESB_HID_PAIRING_CANDIDATE) {
+        memcpy(pairing.candidate_name, &body[2], name_len);
+        pairing.candidate_name[name_len] = '\0';
+        if (pairing.state == ESB_HID_PAIRING_SEARCHING) {
+            pairing.state = ESB_HID_PAIRING_CANDIDATE;
+            LOG_INF("Pairing: candidate \"%s\" for slot %d", pairing.candidate_name,
+                    pairing.target_slot);
         }
-    } else {
-        status_boot_armed = true;
+        /* Sentinel reload: tell the keyboard "not yet". */
+        pairing_load_payload(ESB_HID_PAIR_SLOT_NOT_YET, NULL);
+    } else if (pairing.state == ESB_HID_PAIRING_ASSIGNING) {
+        /* Keep the assignment in front of the keyboard until it
+         * adopts it (and goes quiet) or the give-up timer fires. */
+        pairing_load_payload(pairing.target_slot, pairing.candidate_name);
     }
 }
+
+int esb_hid_pairing_open(uint8_t target_slot) {
+    if (target_slot >= ESB_HID_SLOT_COUNT) {
+        return -EINVAL;
+    }
+
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    if (pairing.state != ESB_HID_PAIRING_IDLE && pairing.state != ESB_HID_PAIRING_DONE) {
+        k_mutex_unlock(&esb_hid_rx_mutex);
+        return -EBUSY;
+    }
+
+    pairing.state = ESB_HID_PAIRING_SEARCHING;
+    pairing.target_slot = target_slot;
+    pairing.candidate_name[0] = '\0';
+    pairing.deadline_ms = k_uptime_get() + ESB_HID_PAIRING_WINDOW_MS;
+    pairing.last_request_ms = 0;
+    pairing_load_payload(ESB_HID_PAIR_SLOT_NOT_YET, NULL);
+    k_work_reschedule(&pairing_timer_work, K_MSEC(ESB_HID_PAIRING_TIMER_PERIOD_MS));
+    k_mutex_unlock(&esb_hid_rx_mutex);
+
+    LOG_INF("Pairing: window opened for slot %d (60 s)", target_slot);
+    return 0;
+}
+
+int esb_hid_pairing_get_status(struct esb_hid_pairing_status *out) {
+    if (out == NULL) {
+        return -EINVAL;
+    }
+
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    out->state = pairing.state;
+    out->target_slot = pairing.target_slot;
+    strncpy(out->candidate_name, pairing.candidate_name, ESB_HID_NAME_MAX);
+    out->candidate_name[ESB_HID_NAME_MAX] = '\0';
+    if (pairing.state == ESB_HID_PAIRING_IDLE) {
+        out->remaining_ms = 0;
+    } else {
+        int64_t left = pairing.deadline_ms - k_uptime_get();
+        out->remaining_ms = (int32_t)(left > 0 ? left : 0);
+    }
+    k_mutex_unlock(&esb_hid_rx_mutex);
+    return 0;
+}
+
+int esb_hid_pairing_confirm(void) {
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    if (pairing.state != ESB_HID_PAIRING_CANDIDATE) {
+        k_mutex_unlock(&esb_hid_rx_mutex);
+        return -EINVAL;
+    }
+
+    pairing.state = ESB_HID_PAIRING_ASSIGNING;
+    pairing.assigning_since_ms = k_uptime_get();
+    pairing_load_payload(pairing.target_slot, pairing.candidate_name);
+    k_mutex_unlock(&esb_hid_rx_mutex);
+
+    LOG_INF("Pairing: assigning slot %d to \"%s\"", pairing.target_slot, pairing.candidate_name);
+    return 0;
+}
+
+void esb_hid_pairing_cancel(void) {
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    pairing.state = ESB_HID_PAIRING_IDLE;
+    pairing.candidate_name[0] = '\0';
+    k_work_cancel_delayable(&pairing_timer_work);
+    k_mutex_unlock(&esb_hid_rx_mutex);
+    LOG_INF("Pairing: cancelled");
+}
+
+/* ------------------------------------------------------------------ */
+/* Public slot API                                                     */
+
+uint8_t esb_hid_rx_get_active_slot(void) { return registry.active_slot; }
 
 static const uint8_t report_ids[] = {
     ZMK_HID_REPORT_ID_KEYBOARD,
@@ -107,16 +400,212 @@ static const uint8_t report_ids[] = {
     ZMK_HID_REPORT_ID_MOUSE,
 };
 
+int esb_hid_rx_set_active_slot(uint8_t slot) {
+    if (slot >= ESB_HID_SLOT_COUNT) {
+        return -EINVAL;
+    }
+
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    if (!registry.slots[slot].used) {
+        k_mutex_unlock(&esb_hid_rx_mutex);
+        return -EINVAL;
+    }
+    if (slot == registry.active_slot) {
+        k_mutex_unlock(&esb_hid_rx_mutex);
+        return 0;
+    }
+
+    uint8_t old_slot = registry.active_slot;
+
+    /* (a) Release everything the old slot's device may still hold:
+     * send a zeroed body for each HID type it ever sent. */
+    for (int type = 0; type < 3; type++) {
+        if (peers[old_slot].hid_cache[type].valid) {
+            uint8_t zeroed[ESB_HID_CACHE_BODY_MAX] = {0};
+
+            zmk_usb_hid_send_report_with_id(report_ids[type], zeroed,
+                                            peers[old_slot].hid_cache[type].len);
+        }
+    }
+
+    /* (b) The Studio session belongs to the old device: flush it.
+     * This also purges the radio's ACK payload FIFO on all pipes, so
+     * no stale downlink fragment can reach the new device. */
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
+    esb_hid_studio_fwd_flush_session();
+#endif
+
+    /* (c) Switch and persist. Studio ACK payloads follow the active
+     * slot automatically via esb_hid_rx_studio_pipe(). */
+    registry.active_slot = slot;
+    registry_save();
+
+    /* (d) Re-inject the new slot's held keyboard/consumer state so
+     * keys it is physically holding keep working. Mouse is relative
+     * and is never re-injected. */
+    for (int type = 0; type < 2; type++) {
+        if (!peers[slot].hid_cache[type].valid) {
+            continue;
+        }
+        bool nonzero = false;
+
+        for (int i = 0; i < peers[slot].hid_cache[type].len; i++) {
+            if (peers[slot].hid_cache[type].body[i] != 0) {
+                nonzero = true;
+                break;
+            }
+        }
+        if (nonzero) {
+            zmk_usb_hid_send_report_with_id(report_ids[type], peers[slot].hid_cache[type].body,
+                                            peers[slot].hid_cache[type].len);
+        }
+    }
+
+    LOG_INF("Active slot: %d -> %d (\"%s\")", old_slot, slot, registry.slots[slot].name);
+    k_mutex_unlock(&esb_hid_rx_mutex);
+    return 0;
+}
+
+int esb_hid_rx_get_slot_info(uint8_t slot, struct esb_hid_slot_info *out) {
+    if (slot >= ESB_HID_SLOT_COUNT || out == NULL) {
+        return -EINVAL;
+    }
+
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    out->used = registry.slots[slot].used != 0;
+    strncpy(out->name, registry.slots[slot].name, ESB_HID_NAME_MAX);
+    out->name[ESB_HID_NAME_MAX] = '\0';
+    if (out->name[0] == '\0' && peers[slot].status.valid) {
+        /* Unregistered slot: fall back to the broadcast name so the
+         * UI can still show who is talking. */
+        strncpy(out->name, peers[slot].status.name, ESB_HID_NAME_MAX);
+        out->name[ESB_HID_NAME_MAX] = '\0';
+    }
+    out->status_valid = peers[slot].status.valid;
+    out->battery = peers[slot].status.valid ? peers[slot].status.battery : 0xFF;
+    out->layer = peers[slot].status.layer;
+    out->output = peers[slot].status.output;
+    if (peers[slot].last_seen_ms == 0) {
+        out->link_up = false;
+        out->last_seen_age_ms = -1;
+    } else {
+        int64_t age = k_uptime_get() - peers[slot].last_seen_ms;
+
+        out->last_seen_age_ms = age;
+        out->link_up = age < ESB_HID_LINK_LOST_TIMEOUT_MS;
+    }
+    k_mutex_unlock(&esb_hid_rx_mutex);
+    return 0;
+}
+
+int esb_hid_rx_delete_slot(uint8_t slot) {
+    if (slot >= ESB_HID_SLOT_COUNT) {
+        return -EINVAL;
+    }
+
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    registry.slots[slot].used = 0;
+    registry.slots[slot].name[0] = '\0';
+    registry_save();
+    LOG_INF("ESB registry: slot %d deleted", slot);
+    k_mutex_unlock(&esb_hid_rx_mutex);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Frame handling                                                      */
+
+static void handle_status(uint8_t slot, const uint8_t *data, size_t len) {
+    if (len < sizeof(struct esb_hid_status_body)) {
+        LOG_WRN("Malformed status frame (len %d)", (int)len);
+        return;
+    }
+
+    const struct esb_hid_status_body *body = (const struct esb_hid_status_body *)data;
+    struct esb_hid_peer *peer = &peers[slot];
+
+    uint8_t output = (uint8_t)((body->flags & ESB_HID_STATUS_FLAG_OUTPUT_MASK) >>
+                               ESB_HID_STATUS_FLAG_OUTPUT_SHIFT);
+
+    /* Status v2 name trailer: [name_len][name] after the fixed body. */
+    char name[ESB_HID_NAME_MAX + 1] = "";
+
+    if (body->proto_version >= 2 && len > sizeof(struct esb_hid_status_body)) {
+        size_t name_len = data[sizeof(struct esb_hid_status_body)];
+
+        if (name_len > len - sizeof(struct esb_hid_status_body) - 1) {
+            name_len = len - sizeof(struct esb_hid_status_body) - 1;
+        }
+        if (name_len > ESB_HID_NAME_MAX) {
+            name_len = ESB_HID_NAME_MAX;
+        }
+        memcpy(name, &data[sizeof(struct esb_hid_status_body) + 1], name_len);
+        name[name_len] = '\0';
+    }
+
+    if (!peer->status.valid || peer->status.battery != body->battery ||
+        peer->status.layer != body->layer || peer->status.output != output ||
+        strcmp(peer->status.name, name) != 0) {
+        if (body->battery == ESB_HID_BATTERY_UNKNOWN) {
+            LOG_INF("Peer %d status: battery unknown, layer %d, output %d", slot, body->layer,
+                    output);
+        } else {
+            LOG_INF("Peer %d status: battery %d%%, layer %d, output %d", slot, body->battery,
+                    body->layer, output);
+        }
+    }
+
+    peer->status.battery = body->battery;
+    peer->status.layer = body->layer;
+    peer->status.flags = body->flags;
+    peer->status.output = output;
+    peer->status.proto_version = body->proto_version;
+    strncpy(peer->status.name, name, ESB_HID_NAME_MAX);
+    peer->status.name[ESB_HID_NAME_MAX] = '\0';
+    peer->status.last_update_ms = k_uptime_get();
+    peer->status.valid = true;
+
+    /* Edge-detect the keyboard's BOOT flag: it is set for the first
+     * few status frames after a keyboard reboot and clear afterwards,
+     * so a set frame while armed means "new boot". The Studio session
+     * state held for the previous boot is stale then and would poison
+     * the fresh session, so flush it — but only when the booting
+     * device is the active one: the Studio session belongs to the
+     * active device, and an inactive device rebooting must not tear
+     * down the active device's session. The duplicate suppression for
+     * this slot restarts either way: its seq counters restarted at 0,
+     * and a fresh frame whose seq happens to equal the stale last_seq
+     * must not be dropped as a duplicate. */
+    if (body->flags & ESB_HID_STATUS_FLAG_BOOT) {
+        if (peer->boot_armed) {
+            peer->boot_armed = false;
+            for (int i = 0; i < ESB_HID_TYPE_COUNT; i++) {
+                seq_valid[slot][i] = false;
+            }
+            if (slot == registry.active_slot) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
+                esb_hid_studio_fwd_flush_session();
+#endif
+                LOG_INF("Peer %d reboot detected, receiver session state flushed", slot);
+            } else {
+                LOG_INF("Peer %d reboot detected (inactive slot, no flush)", slot);
+            }
+        }
+    } else {
+        peer->boot_armed = true;
+    }
+}
+
 /* Link indicator: blink the board's green user LED (devicetree alias
  * led1) for as long as the link is alive. Any accepted frame refreshes
- * the liveness timestamp; the TX status heartbeat (every 30 s) keeps
- * the link marked alive while the keyboard is on, so this blinks
+ * the liveness timestamp; the TX status heartbeat (every 5 s) keeps
+ * the link marked alive while a keyboard is on, so this blinks
  * continuously during normal use and stops within the timeout after
  * the TX goes away. Boards without the alias build without it. */
 #if DT_NODE_EXISTS(DT_ALIAS(led1)) && DT_NODE_EXISTS(DT_ALIAS(led0))
 #define ESB_HID_LINK_LED 1
 
-#define ESB_HID_LINK_ALIVE_MS 45000 /* 1.5x the TX heartbeat period */
+#define ESB_HID_LINK_ALIVE_MS 45000
 #define ESB_HID_LINK_BLINK_MS 250
 
 static const struct gpio_dt_spec link_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
@@ -184,59 +673,105 @@ static void handle_payload(const struct esb_payload *payload) {
 
     uint8_t type = payload->data[0];
     uint8_t seq = payload->data[1];
+    uint8_t pipe = payload->pipe;
 
-    if (type >= ESB_HID_TYPE_COUNT) {
+    if (type >= ESB_HID_TYPE_COUNT || pipe >= 8) {
         return;
     }
+
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
 
     /* Keyboard/consumer/status are state: drop exact duplicates
      * (e.g. a re-delivered frame after a lost ACK). Mouse is relative;
-     * every frame carries new motion, so forward all of them. */
+     * every frame carries new motion, so forward all of them. Dedup
+     * is per pipe, so one device's seq never suppresses another's. */
     if (type != ESB_HID_TYPE_MOUSE) {
-        if (seq_valid[type] && seq == last_seq[type]) {
+        if (seq_valid[pipe][type] && seq == last_seq[pipe][type]) {
+            k_mutex_unlock(&esb_hid_rx_mutex);
             return;
         }
-        seq_valid[type] = true;
-        last_seq[type] = seq;
+        seq_valid[pipe][type] = true;
+        last_seq[pipe][type] = seq;
     }
 
-    last_frame_ms = k_uptime_get();
-    link_led_note_frame();
+    const uint8_t *body = &payload->data[ESB_HID_FRAME_HDR_LEN];
+    size_t body_len = payload->length - ESB_HID_FRAME_HDR_LEN;
 
-    if (type == ESB_HID_TYPE_STUDIO) {
-#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
-        esb_hid_studio_fwd_to_pc(&payload->data[ESB_HID_FRAME_HDR_LEN],
-                                 payload->length - ESB_HID_FRAME_HDR_LEN);
-#endif
+    if (pipe == ESB_HID_PAIRING_PIPE) {
+        /* Pairing pipe: only PAIR_REQUEST is meaningful here. */
+        if (type == ESB_HID_TYPE_PAIR_REQUEST) {
+            pairing_on_request(body, body_len);
+        }
+        k_mutex_unlock(&esb_hid_rx_mutex);
         return;
     }
 
-    if (type == ESB_HID_TYPE_STUDIO_HINT) {
+    if (pipe >= ESB_HID_SLOT_COUNT) {
+        /* Pipes 4..6 are not enabled; ignore defensively. */
+        k_mutex_unlock(&esb_hid_rx_mutex);
+        return;
+    }
+
+    uint8_t slot = pipe;
+    struct esb_hid_peer *peer = &peers[slot];
+
+    peer->last_seen_ms = k_uptime_get();
+    link_led_note_frame();
+
+    bool forward = (slot == registry.active_slot) && registry.slots[slot].used;
+
+    switch (type) {
+    case ESB_HID_TYPE_STUDIO:
+        /* Studio uplink likewise only from the active slot. */
+        if (forward) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
+            esb_hid_studio_fwd_to_pc(body, body_len);
+#endif
+        }
+        break;
+    case ESB_HID_TYPE_STUDIO_HINT:
         /* Hints only ever travel as ACK payloads (RX->TX). One
          * arriving as a regular uplink frame is a protocol error;
          * never forward it to USB HID. */
-        return;
-    }
-
-    if (type == ESB_HID_TYPE_POLL) {
+        break;
+    case ESB_HID_TYPE_POLL:
         /* Polls exist only to pull ACK payloads; nothing to forward.
          * (The ACK refill itself is triggered from the RX event
          * handler, which fires for polls as well.) */
-        return;
+        break;
+    case ESB_HID_TYPE_STATUS:
+        handle_status(slot, body, body_len);
+        break;
+    case ESB_HID_TYPE_KEYBOARD:
+    case ESB_HID_TYPE_CONSUMER:
+    case ESB_HID_TYPE_MOUSE: {
+        /* Cache the latest body per (slot, type) for slot switching,
+         * whether or not this slot is currently forwarded. */
+        size_t cache_len = body_len;
+
+        if (cache_len > ESB_HID_CACHE_BODY_MAX) {
+            cache_len = ESB_HID_CACHE_BODY_MAX;
+        }
+        memcpy(peer->hid_cache[type].body, body, cache_len);
+        peer->hid_cache[type].len = (uint8_t)cache_len;
+        peer->hid_cache[type].valid = true;
+
+        if (forward) {
+            int err = zmk_usb_hid_send_report_with_id(report_ids[type], body, body_len);
+
+            if (err) {
+                LOG_WRN("USB HID forward failed (type %d): %d", type, err);
+            }
+        }
+        break;
+    }
+    default:
+        /* PAIR_REQUEST / PAIR_ASSIGN on a slot pipe: protocol error,
+         * ignore. */
+        break;
     }
 
-    if (type == ESB_HID_TYPE_STATUS) {
-        handle_status(&payload->data[ESB_HID_FRAME_HDR_LEN],
-                      payload->length - ESB_HID_FRAME_HDR_LEN);
-        return;
-    }
-
-    int err = zmk_usb_hid_send_report_with_id(report_ids[type],
-                                              &payload->data[ESB_HID_FRAME_HDR_LEN],
-                                              payload->length - ESB_HID_FRAME_HDR_LEN);
-    if (err) {
-        LOG_WRN("USB HID forward failed (type %d): %d", type, err);
-    }
+    k_mutex_unlock(&esb_hid_rx_mutex);
 }
 
 static void rx_thread(void) {
@@ -260,6 +795,7 @@ static K_WORK_DELAYABLE_DEFINE(rx_link_retry_work, rx_link_retry);
 
 static void rx_link_retry(struct k_work *work) {
     LOG_INF("esb_hid: RX link start attempt (ESBHID-3)");
+    registry_load_once();
     int err = esb_hid_link_start(ESB_MODE_PRX, esb_hid_rx_event_handler);
 
 #if ESB_HID_LINK_LED
@@ -279,6 +815,9 @@ static int esb_hid_rx_init(void) {
         k_work_schedule(&link_blink_work, K_MSEC(ESB_HID_LINK_BLINK_MS));
     }
 #endif
+    for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+        peers[i].boot_armed = true;
+    }
     /* First attempt deferred 6 s, same reason as TX: don't lose the
      * original error to the not-yet-attached USB console. */
     LOG_INF("esb_hid: RX init, first link start in 6s (ESBHID-3)");

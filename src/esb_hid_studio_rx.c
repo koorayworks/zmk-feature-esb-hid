@@ -199,7 +199,7 @@ static void esb_studio_maybe_load_hint(void) {
 
     struct esb_payload payload = {
         .length = ESB_HID_FRAME_HDR_LEN + 1,
-        .pipe = 0,
+        .pipe = esb_hid_rx_studio_pipe(),
         .noack = 0,
     };
     payload.data[0] = ESB_HID_TYPE_STUDIO_HINT;
@@ -242,7 +242,7 @@ static void esb_studio_ack_loader_thread(void) {
 
             struct esb_payload payload = {
                 .length = (uint8_t)(claim_len + ESB_HID_FRAME_HDR_LEN),
-                .pipe = 0,
+                .pipe = esb_hid_rx_studio_pipe(),
                 .noack = 0,
             };
             payload.data[0] = ESB_HID_TYPE_STUDIO;

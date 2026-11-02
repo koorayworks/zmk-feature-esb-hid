@@ -26,14 +26,22 @@
  * 5 s, so this is two missed heartbeats plus a safety margin. */
 #define ESB_HID_LINK_LOST_TIMEOUT_MS 15000
 
+/* Maximum device name length in characters (excluding the NUL).
+ * Carried in status v2 frames and in the pairing exchange; defined
+ * here so both public headers compile standalone. */
+#ifndef ESB_HID_NAME_MAX
+#define ESB_HID_NAME_MAX 16
+#endif
+
 struct esb_hid_device_status {
     uint8_t battery; /* 0-100 %, 0xFF = unknown */
     uint8_t layer;
     uint8_t flags;
     uint8_t output; /* ESB_HID_STATUS_OUTPUT_* decoded from flags */
     uint8_t proto_version;
-    int64_t last_update_ms; /* k_uptime_get() of the last status frame */
-    int64_t last_seen_ms;   /* k_uptime_get() of the last frame of any type */
+    char name[ESB_HID_NAME_MAX + 1]; /* from status v2 frames; "" for v1 peers */
+    int64_t last_update_ms;         /* k_uptime_get() of the last status frame */
+    int64_t last_seen_ms;           /* k_uptime_get() of the last frame of any type */
     bool valid;
 };
 

@@ -29,6 +29,12 @@ void esb_hid_studio_fwd_to_pc(const uint8_t *data, size_t len);
  * (re)loaded into the ESB ACK FIFO. */
 void esb_hid_studio_fwd_note_link_event(void);
 
+/* RX side: the pipe Studio ACK payloads (fragments and hints) must be
+ * loaded on — the active slot's pipe. Implemented in esb_hid_rx.c.
+ * ACK payload queues are per-pipe in the ESB stack, so payloads loaded
+ * on any other pipe would never reach the active keyboard. */
+uint8_t esb_hid_rx_studio_pipe(void);
+
 /* RX side: flush the Studio session state held for the current peer
  * boot (pending downlink bytes, queued ACK payloads in the radio).
  * Called when the keyboard signals a reboot via the status BOOT flag;

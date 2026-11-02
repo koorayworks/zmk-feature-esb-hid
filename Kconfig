@@ -8,11 +8,40 @@ config ZMK_ESB_HID
 	depends on SOC_SERIES_NRF52X || SOC_SERIES_NRF53X || SOC_SERIES_NRF54LX
 	select ESB
 	select ESB_CLOCK_INIT
+	select SETTINGS
+	# NVS needs FLASH + FLASH_PAGE_LAYOUT; select it only where the
+	# board provides them (e.g. the xiao_ble//zmk variant), so plain
+	# board targets without flash still build (settings then have no
+	# backend and saves simply fail at runtime there).
+	select NVS if FLASH && FLASH_PAGE_LAYOUT
 	help
 	  Send this keyboard's HID reports (keyboard / consumer / mouse) over
 	  Nordic ESB to a receiver running the same module with
 	  ZMK_ESB_HID_RECEIVER enabled. Requires the ZMK fork hooks
 	  (ZMK_TRANSPORT_ESB in endpoints).
+
+	  SETTINGS/NVS hold the paired slot override ("esb_hid/slot"),
+	  written when the receiver assigns a slot during pairing.
+
+config ZMK_ESB_HID_SLOT
+	int "ESB slot (pipe) this keyboard uses by default"
+	depends on ZMK_ESB_HID
+	range 0 3
+	default 0
+	help
+	  Slot 0..3 = ESB pipe the keyboard transmits on. A slot assigned
+	  during pairing is stored in settings ("esb_hid/slot") and takes
+	  precedence over this build-time default.
+
+config ZMK_ESB_HID_DEVICE_NAME
+	string "Device name advertised over ESB"
+	depends on ZMK_ESB_HID
+	default "KEYBOARD"
+	help
+	  Human-readable name sent in status v2 frames and in pairing
+	  requests. Truncated to 16 characters on the wire. The receiver
+	  shows it in its device list, and a pairing assignment is only
+	  adopted when the name it carries matches this name exactly.
 
 config ZMK_ESB_HID_STUDIO
 	bool "ZMK Studio RPC over ESB (keyboard side)"
@@ -41,6 +70,15 @@ config ZMK_ESB_HID_RECEIVER
 	depends on SOC_SERIES_NRF52X || SOC_SERIES_NRF53X || SOC_SERIES_NRF54LX
 	select ESB
 	select ESB_CLOCK_INIT
+	select SETTINGS
+	# NVS needs FLASH + FLASH_PAGE_LAYOUT; select it only where the
+	# board provides them (e.g. the xiao_ble//zmk variant), so plain
+	# board targets without flash still build (settings then have no
+	# backend and saves simply fail at runtime there).
+	select NVS if FLASH && FLASH_PAGE_LAYOUT
 	help
 	  Receive HID reports over Nordic ESB and forward them to USB HID.
 	  Intended for a matrix-less ZMK build acting as the receiver.
+
+	  SETTINGS/NVS hold the slot registry ("esb_hid/registry"): which
+	  slots are paired, their device names, and the active slot.

@@ -10,6 +10,10 @@ endif()
 
 if(CONFIG_ZMK_ESB_HID)
   target_sources(app PRIVATE src/esb_hid_tx.c)
+  # The &esb_pair behavior driver compiles to nothing when no
+  # zmk,behavior-esb-pair node exists in the devicetree
+  # (DT_HAS_COMPAT_STATUS_OKAY guard inside the source).
+  target_sources(app PRIVATE src/behaviors/behavior_esb_pair.c)
 endif()
 
 if(CONFIG_ZMK_ESB_HID_STUDIO)

@@ -15,11 +15,13 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
 
 #include <string.h>
 
 #include <esb.h>
+#include <esb_hid.h>
 #include <esb_hid_status.h>
 #include <zmk/battery.h>
 #include <zmk/endpoints.h>
@@ -159,6 +161,71 @@ static uint8_t seqs[ESB_HID_TYPE_COUNT];
 static volatile bool resync_keyboard;
 static volatile bool resync_consumer;
 
+/* ------------------------------------------------------------------ */
+/* Slot assignment (step 2)                                            */
+
+/* Own slot = ESB pipe for all normal traffic. Resolved at link start
+ * from the settings override ("esb_hid/slot", written when a receiver
+ * assigns a slot during pairing) or CONFIG_ZMK_ESB_HID_SLOT. */
+static uint8_t own_slot = CONFIG_ZMK_ESB_HID_SLOT;
+/* Pipe the next transmitted frame goes out on: own_slot normally,
+ * ESB_HID_PAIRING_PIPE while pairing. Read by send_frame(). */
+static volatile uint8_t tx_pipe = CONFIG_ZMK_ESB_HID_SLOT;
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+static bool slot_override_valid;
+static uint8_t slot_override;
+
+static int esb_hid_tx_settings_set(const char *name, size_t len, settings_read_cb read_cb,
+                                   void *cb_arg) {
+    const char *next;
+
+    if (settings_name_steq(name, "slot", &next) && !next) {
+        if (len != sizeof(slot_override)) {
+            return -EINVAL;
+        }
+        int rc = read_cb(cb_arg, &slot_override, sizeof(slot_override));
+
+        if (rc >= 0) {
+            slot_override_valid = slot_override < ESB_HID_SLOT_COUNT;
+            return 0;
+        }
+        return rc;
+    }
+    return -ENOENT;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(esb_hid_tx, "esb_hid", NULL, esb_hid_tx_settings_set, NULL, NULL);
+#endif /* IS_ENABLED(CONFIG_SETTINGS) */
+
+static void resolve_own_slot(void) {
+#if IS_ENABLED(CONFIG_SETTINGS)
+    /* ZMK's main() already ran settings_load() once; load our subtree
+     * again here so the value is in place even if that ordering ever
+     * changes. Idempotent: the handler just re-reads the same key. */
+    settings_load_subtree("esb_hid");
+    if (slot_override_valid) {
+        own_slot = slot_override;
+    }
+#endif
+    tx_pipe = own_slot;
+    LOG_INF("esb_hid: TX slot %d, device name \"%s\"", own_slot, CONFIG_ZMK_ESB_HID_DEVICE_NAME);
+}
+
+/* Own device name as advertised on the wire: the Kconfig string
+ * truncated to ESB_HID_NAME_MAX chars. Written NUL-terminated into
+ * buf (ESB_HID_NAME_MAX + 1 bytes); returns the name length. */
+static size_t own_name(char *buf) {
+    size_t len = strlen(CONFIG_ZMK_ESB_HID_DEVICE_NAME);
+
+    if (len > ESB_HID_NAME_MAX) {
+        len = ESB_HID_NAME_MAX;
+    }
+    memcpy(buf, CONFIG_ZMK_ESB_HID_DEVICE_NAME, len);
+    buf[len] = '\0';
+    return len;
+}
+
 static K_SEM_DEFINE(tx_done_sem, 0, 1);
 static volatile bool tx_last_ok;
 
@@ -179,6 +246,54 @@ static void esb_hid_tx_event_handler(const struct esb_evt *evt) {
 }
 
 static int enqueue_report(uint8_t type, const uint8_t *body, size_t len);
+
+/* Pairing state (defined further below, next to the state machine). */
+static bool pairing_active;
+static void pairing_handle_assign(const uint8_t *body, size_t len);
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
+/* Studio helpers (defined in the Studio section below). */
+static void studio_note_activity(void);
+static void studio_handle_hint(uint8_t flags);
+#endif
+
+/* Drain any pending ACK payloads. Called from the TX thread (never
+ * from the ESB event handler, whose context is not safe for this).
+ * Routes Studio fragments/hints to the Studio glue and pairing
+ * assignments to the pairing state machine. Runs with or without
+ * Studio: pairing must work on non-Studio builds too. */
+static void drain_ack_payloads(void) {
+    struct esb_payload payload;
+
+    while (esb_read_rx_payload(&payload) == 0) {
+        if (payload.length <= ESB_HID_FRAME_HDR_LEN) {
+            continue;
+        }
+        const uint8_t *body = &payload.data[ESB_HID_FRAME_HDR_LEN];
+        size_t body_len = payload.length - ESB_HID_FRAME_HDR_LEN;
+
+        switch (payload.data[0]) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
+        case ESB_HID_TYPE_STUDIO:
+            studio_note_activity();
+            esb_hid_studio_on_rx_bytes(body, body_len);
+            break;
+        case ESB_HID_TYPE_STUDIO_HINT:
+            studio_handle_hint(body[0]);
+            break;
+#endif
+        case ESB_HID_TYPE_PAIR_ASSIGN:
+            if (pairing_active) {
+                pairing_handle_assign(body, body_len);
+            }
+            break;
+        default:
+            LOG_DBG("Ignoring unexpected ACK payload type %d (len %d)", payload.data[0],
+                    payload.length);
+            break;
+        }
+    }
+}
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
 /* ------------------------------------------------------------------ */
@@ -227,26 +342,6 @@ static void studio_handle_hint(uint8_t flags) {
          * request the app sends right after connecting is pulled in
          * without waiting for the next user keypress / heartbeat. */
         studio_probe_until_ms = k_uptime_get() + ESB_HID_STUDIO_PROBE_WINDOW_MS;
-    }
-}
-
-/* Drain any pending ACK payloads. Called from the TX thread (never
- * from the ESB event handler, whose context is not safe for this). */
-static void studio_drain_ack_payloads(void) {
-    struct esb_payload payload;
-
-    while (esb_read_rx_payload(&payload) == 0) {
-        if (payload.length > ESB_HID_FRAME_HDR_LEN &&
-            payload.data[0] == ESB_HID_TYPE_STUDIO) {
-            studio_note_activity();
-            esb_hid_studio_on_rx_bytes(&payload.data[ESB_HID_FRAME_HDR_LEN],
-                                       payload.length - ESB_HID_FRAME_HDR_LEN);
-        } else if (payload.length > ESB_HID_FRAME_HDR_LEN &&
-                   payload.data[0] == ESB_HID_TYPE_STUDIO_HINT) {
-            studio_handle_hint(payload.data[ESB_HID_FRAME_HDR_LEN]);
-        } else {
-            LOG_DBG("Ignoring non-studio ACK payload (len %d)", payload.length);
-        }
     }
 }
 
@@ -348,7 +443,17 @@ static void send_status_snapshot(void) {
     body.battery = zmk_battery_state_of_charge();
 #endif
 
-    enqueue_report(ESB_HID_TYPE_STATUS, (const uint8_t *)&body, sizeof(body));
+    /* Status v2: append the [name_len][name] trailer after the fixed
+     * 4-byte v1 body. */
+    uint8_t frame_body[sizeof(body) + 1 + ESB_HID_NAME_MAX];
+    char name[ESB_HID_NAME_MAX + 1];
+    size_t name_len = own_name(name);
+
+    memcpy(frame_body, &body, sizeof(body));
+    frame_body[sizeof(body)] = (uint8_t)name_len;
+    memcpy(&frame_body[sizeof(body) + 1], name, name_len);
+
+    enqueue_report(ESB_HID_TYPE_STATUS, frame_body, sizeof(body) + 1 + name_len);
 }
 
 static void status_heartbeat(struct k_work *work) {
@@ -387,6 +492,113 @@ ZMK_SUBSCRIPTION(esb_hid_tx, zmk_endpoint_changed);
 ZMK_SUBSCRIPTION(esb_hid_tx, zmk_battery_state_changed);
 #endif
 
+/* ------------------------------------------------------------------ */
+/* Pairing (step 2)                                                    */
+
+/* Pairing window: PAIR_REQUEST every ~500 ms for up to 30 s. */
+#define ESB_HID_PAIRING_DURATION_MS 30000
+#define ESB_HID_PAIRING_REQUEST_PERIOD_MS 500
+
+static int64_t pairing_deadline_ms;
+
+static void pairing_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(pairing_work, pairing_work_handler);
+
+static void pairing_exit(void) {
+    pairing_active = false;
+    tx_pipe = own_slot;
+    k_work_cancel_delayable(&pairing_work);
+}
+
+static void pairing_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (!pairing_active) {
+        return;
+    }
+    if (k_uptime_get() >= pairing_deadline_ms) {
+        pairing_exit();
+        LOG_INF("Pairing: timed out after 30 s, back to slot %d", own_slot);
+        return;
+    }
+
+    char name[ESB_HID_NAME_MAX + 1];
+    size_t name_len = own_name(name);
+    uint8_t body[2 + ESB_HID_NAME_MAX];
+
+    body[0] = ESB_HID_PAIR_PROTO_VERSION;
+    body[1] = (uint8_t)name_len;
+    memcpy(&body[2], name, name_len);
+    enqueue_report(ESB_HID_TYPE_PAIR_REQUEST, body, 2 + name_len);
+
+    k_work_reschedule(&pairing_work, K_MSEC(ESB_HID_PAIRING_REQUEST_PERIOD_MS));
+}
+
+static void pairing_handle_assign(const uint8_t *body, size_t len) {
+    if (len < 2) {
+        return;
+    }
+
+    uint8_t slot = body[0];
+
+    if (slot == ESB_HID_PAIR_SLOT_NOT_YET) {
+        /* Sentinel: the receiver sees us but has not confirmed a
+         * candidate yet. Keep requesting. */
+        return;
+    }
+    if (slot >= ESB_HID_SLOT_COUNT) {
+        LOG_WRN("Pairing: ignoring assignment with invalid slot %d", slot);
+        return;
+    }
+
+    uint8_t name_len = body[1];
+
+    if (name_len > len - 2) {
+        name_len = (uint8_t)(len - 2);
+    }
+
+    char mine[ESB_HID_NAME_MAX + 1];
+    size_t my_len = own_name(mine);
+
+    if (name_len != my_len || memcmp(&body[2], mine, my_len) != 0) {
+        LOG_WRN("Pairing: assignment name \"%.*s\" does not match ours (\"%s\"), ignoring",
+                name_len, (const char *)&body[2], mine);
+        return;
+    }
+
+    own_slot = slot;
+#if IS_ENABLED(CONFIG_SETTINGS)
+    int err = settings_save_one("esb_hid/slot", &own_slot, sizeof(own_slot));
+
+    if (err) {
+        LOG_ERR("Pairing: failed to save assigned slot: %d", err);
+    }
+#endif
+    pairing_exit();
+    LOG_INF("Pairing: assigned slot %d for \"%s\", saved to settings", slot, mine);
+}
+
+int esb_hid_tx_start_pairing(void) {
+    if (!link_ready) {
+        return -EAGAIN;
+    }
+    if (pairing_active) {
+        return -EBUSY;
+    }
+
+    pairing_active = true;
+    pairing_deadline_ms = k_uptime_get() + ESB_HID_PAIRING_DURATION_MS;
+    tx_pipe = ESB_HID_PAIRING_PIPE;
+    k_work_reschedule(&pairing_work, K_NO_WAIT);
+
+    char name[ESB_HID_NAME_MAX + 1];
+
+    own_name(name);
+    LOG_INF("Pairing: started (name \"%s\"), requesting on pipe %d for 30 s", name,
+            ESB_HID_PAIRING_PIPE);
+    return 0;
+}
+
 bool zmk_esb_hid_is_ready(void) { return link_ready; }
 
 int zmk_esb_hid_send_keyboard_report(struct zmk_hid_keyboard_report_body *body) {
@@ -406,7 +618,7 @@ int zmk_esb_hid_send_mouse_report(struct zmk_hid_mouse_report_body *body) {
 static void send_frame(const struct esb_hid_frame *frame) {
     struct esb_payload payload = {
         .length = frame->len + ESB_HID_FRAME_HDR_LEN,
-        .pipe = 0,
+        .pipe = tx_pipe,
         .noack = 0,
     };
     payload.data[0] = frame->type;
@@ -466,17 +678,22 @@ static void tx_thread(void) {
 
     while (1) {
         if (k_msgq_get(&esb_hid_tx_queue, &frame, K_MSEC(20)) == 0) {
-            send_frame(&frame);
-#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
+            /* While pairing, normal HID/status/studio traffic is
+             * paused: only PAIR_REQUEST frames leave on the pairing
+             * pipe. Everything else is dropped (state reports are
+             * re-sent after pairing via the resync mechanism / the
+             * next change event anyway). */
+            if (!pairing_active || frame.type == ESB_HID_TYPE_PAIR_REQUEST) {
+                send_frame(&frame);
+            }
             /* A successful send may have carried an ACK payload. */
-            studio_drain_ack_payloads();
-#endif
+            drain_ack_payloads();
             continue;
         }
 
+        drain_ack_payloads();
 #if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
-        studio_drain_ack_payloads();
-        if (link_ready) {
+        if (link_ready && !pairing_active) {
             studio_maybe_poll();
         }
 #endif
@@ -509,6 +726,9 @@ static K_WORK_DELAYABLE_DEFINE(link_retry_work, link_retry);
 
 static void link_retry(struct k_work *work) {
     LOG_INF("esb_hid: TX link start attempt (ESBHID-3)");
+    /* Resolve the slot (settings override or Kconfig default) before
+     * the first frame goes out; harmless to redo on retries. */
+    resolve_own_slot();
     int err = esb_hid_link_start(ESB_MODE_PTX, esb_hid_tx_event_handler);
 
     diag_note_init(err);
