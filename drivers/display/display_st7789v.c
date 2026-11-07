@@ -42,12 +42,33 @@
  * on hardware the tap screen's stack read reversed and touch
  * disagreed with the drawn buttons. 0x60 is also the exact
  * byte the static patternls build proves on this panel
- * (mdac 0x60, margins x=20/y=0), so ROTATED_90 now reproduces
- * that proven configuration bit for bit. The 180 case was
- * already standard (MY|MX, 0xC0) and its margins are the
- * portrait ones; the visible row window [20, 299] is
- * mirror-symmetric in the 320-row GRAM (320-20-280 = 20), so
- * no orientation needs a mirrored offset on this panel.
+ * (mdac 0x60), so ROTATED_90 keeps that proven MADCTL byte.
+ * The 180 case was already standard (MY|MX, 0xC0).
+ *
+ * A third deviation (2026-11-07, hardware frame check): the
+ * margins are NOT the DT offsets swapped around, and the
+ * earlier assumption that the visible window is centred in
+ * GRAM was wrong. The DT y-offset (20) is the centred value,
+ * (320-280)/2, but on this module the 240x280 glass sits at
+ * the FAR end of the 320-row GRAM (native rows 40..319,
+ * cols 0..239), so the write window needs the FULL 40-line
+ * slack on the long axis. With the centred window [20, 299]
+ * one edge line of the image falls off the glass in EVERY
+ * orientation — confirmed on hardware with the touchtest
+ * pattern frame; the missing line at 180 is the logical
+ * bottom one, and touch was verified numerically exact, so
+ * the defect is purely this display window. The model gives
+ * every orientation its own margin pair (named constants at
+ * set_orientation()): the short axis keeps the DT x-offset
+ * (0), the long axis gets 2 * boot_y_offset (40), on y for
+ * MV=0 orientations and on x for MV=1 ones. MY/MX only pick
+ * the write traversal corner, not the window rectangle, so
+ * 0/180 share a pair and 90/270 share a pair. The model
+ * predicts the centred window loses the logical top line at
+ * 0 deg, right at 90, bottom at 180 (confirmed), left at
+ * 270; the 90/270 pairs rest on the MV axis-exchange behaving
+ * symmetrically with the row axis and are the ones to watch
+ * in the hardware re-check.
  */
 
 #define DT_DRV_COMPAT sitronix_st7789v
@@ -305,6 +326,33 @@ static int st7789v_set_pixel_format(const struct device *dev,
 	return -ENOTSUP;
 }
 
+/*
+ * Per-orientation write-window margins (see the fork note at
+ * the top of this file). The glass is one fixed rectangle in
+ * GRAM — native cols 0..239, native rows 40..319 on this
+ * module — so a margin pair depends only on which logical
+ * axis is the long (320-line) one: y (RASET) for MV=0
+ * orientations, x (CASET) for MV=1 ones. Each orientation's
+ * pair is its own named constant so hardware feedback can
+ * tune one orientation without touching the others. All
+ * values derive from the pristine DT offsets, keeping
+ * set_orientation() idempotent: the short margin is the DT
+ * x-offset (0), the long margin is the full GRAM slack,
+ * 2 * boot_y_offset (the DT y-offset, 20, is only the
+ * centred half-slack).
+ */
+#define ST7789V_MARGIN_SHORT(data)	((data)->boot_x_offset)
+#define ST7789V_MARGIN_LONG(data)	(2U * (data)->boot_y_offset)
+
+#define ST7789V_MARGIN_NORMAL_X(data)	ST7789V_MARGIN_SHORT(data)
+#define ST7789V_MARGIN_NORMAL_Y(data)	ST7789V_MARGIN_LONG(data)
+#define ST7789V_MARGIN_ROT90_X(data)	ST7789V_MARGIN_LONG(data)
+#define ST7789V_MARGIN_ROT90_Y(data)	ST7789V_MARGIN_SHORT(data)
+#define ST7789V_MARGIN_ROT180_X(data)	ST7789V_MARGIN_SHORT(data)
+#define ST7789V_MARGIN_ROT180_Y(data)	ST7789V_MARGIN_LONG(data)
+#define ST7789V_MARGIN_ROT270_X(data)	ST7789V_MARGIN_LONG(data)
+#define ST7789V_MARGIN_ROT270_Y(data)	ST7789V_MARGIN_SHORT(data)
+
 static int st7789v_set_orientation(const struct device *dev,
 				   const enum display_orientation orientation)
 {
@@ -319,36 +367,38 @@ static int st7789v_set_orientation(const struct device *dev,
 	uint16_t x_offset;
 	uint16_t y_offset;
 
-	/* Margins derive from the pristine DT offsets (see the fork
-	 * note at the top): for the axis-swapped orientations the
-	 * panel's x/y offsets swap with the axes. */
+	/* Margins: the per-orientation named constants above,
+	 * derived from the pristine DT offsets (see the fork note
+	 * at the top and the margin note). */
 	switch (orientation) {
 	case DISPLAY_ORIENTATION_NORMAL:
 		tx_data |= ST7789V_MADCTL_MV_NORMAL_MODE;
-		x_offset = data->boot_x_offset;
-		y_offset = data->boot_y_offset;
+		x_offset = ST7789V_MARGIN_NORMAL_X(data);
+		y_offset = ST7789V_MARGIN_NORMAL_Y(data);
 		break;
 	case DISPLAY_ORIENTATION_ROTATED_90:
-		/* Standard table: MX|MV (0x60) — the patternls-proven
-		 * landscape on this panel. Prospector's table has
-		 * MY|MV here (the standard 270); see the fork note. */
+		/* Standard table: MX|MV (0x60) — the MADCTL byte of
+		 * the patternls-proven landscape on this panel (its
+		 * margins were the centred ones; see the margin
+		 * note). Prospector's table has MY|MV here (the
+		 * standard 270); see the fork note. */
 		tx_data |= (ST7789V_MADCTL_MX_RIGHT_TO_LEFT |
 			    ST7789V_MADCTL_MV_REVERSE_MODE);
-		x_offset = data->boot_y_offset;
-		y_offset = data->boot_x_offset;
+		x_offset = ST7789V_MARGIN_ROT90_X(data);
+		y_offset = ST7789V_MARGIN_ROT90_Y(data);
 		break;
 	case DISPLAY_ORIENTATION_ROTATED_180:
 		tx_data |= (ST7789V_MADCTL_MY_BOTTOM_TO_TOP |
 			    ST7789V_MADCTL_MX_RIGHT_TO_LEFT);
-		x_offset = data->boot_x_offset;
-		y_offset = data->boot_y_offset;
+		x_offset = ST7789V_MARGIN_ROT180_X(data);
+		y_offset = ST7789V_MARGIN_ROT180_Y(data);
 		break;
 	case DISPLAY_ORIENTATION_ROTATED_270:
 		/* Standard table: MY|MV (0xA0). */
 		tx_data |= (ST7789V_MADCTL_MY_BOTTOM_TO_TOP |
 			    ST7789V_MADCTL_MV_REVERSE_MODE);
-		x_offset = data->boot_y_offset;
-		y_offset = data->boot_x_offset;
+		x_offset = ST7789V_MARGIN_ROT270_X(data);
+		y_offset = ST7789V_MARGIN_ROT270_Y(data);
 		break;
 	default:
 		LOG_ERR("Unsupported display orientation %d", orientation);
@@ -361,7 +411,8 @@ static int st7789v_set_orientation(const struct device *dev,
 		return ret;
 	}
 	data->orientation = orientation;
-	LOG_INF("Changed orientation to %d", data->orientation);
+	LOG_INF("Changed orientation to %d (margins x=%u y=%u)",
+		data->orientation, x_offset, y_offset);
 
 	return 0;
 }
