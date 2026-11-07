@@ -30,6 +30,24 @@
  * (their code only ever applies it once at boot). Deriving from
  * the DT values makes set_orientation() idempotent, which live
  * cycling 0 -> 90 -> 180 -> 270 -> 0 requires.
+ *
+ * A second, later deviation (v11.5 adjudication, 2026-11-07):
+ * the MADCTL byte assignment follows the ST7789V standard
+ * rotation table — ROTATED_90 = MX|MV (0x60), ROTATED_270 =
+ * MY|MV (0xA0) — and NOT Prospector's table, which is shifted
+ * one step against it. Zephyr's LVGL pointer glue transforms
+ * touch points using the standard convention, so with
+ * Prospector's assignment the panel showed the frame rotated
+ * 180 degrees in-frame away from the logical frame at 90/270:
+ * on hardware the tap screen's stack read reversed and touch
+ * disagreed with the drawn buttons. 0x60 is also the exact
+ * byte the static patternls build proves on this panel
+ * (mdac 0x60, margins x=20/y=0), so ROTATED_90 now reproduces
+ * that proven configuration bit for bit. The 180 case was
+ * already standard (MY|MX, 0xC0) and its margins are the
+ * portrait ones; the visible row window [20, 299] is
+ * mirror-symmetric in the 320-row GRAM (320-20-280 = 20), so
+ * no orientation needs a mirrored offset on this panel.
  */
 
 #define DT_DRV_COMPAT sitronix_st7789v
@@ -311,7 +329,10 @@ static int st7789v_set_orientation(const struct device *dev,
 		y_offset = data->boot_y_offset;
 		break;
 	case DISPLAY_ORIENTATION_ROTATED_90:
-		tx_data |= (ST7789V_MADCTL_MY_BOTTOM_TO_TOP |
+		/* Standard table: MX|MV (0x60) — the patternls-proven
+		 * landscape on this panel. Prospector's table has
+		 * MY|MV here (the standard 270); see the fork note. */
+		tx_data |= (ST7789V_MADCTL_MX_RIGHT_TO_LEFT |
 			    ST7789V_MADCTL_MV_REVERSE_MODE);
 		x_offset = data->boot_y_offset;
 		y_offset = data->boot_x_offset;
@@ -323,7 +344,8 @@ static int st7789v_set_orientation(const struct device *dev,
 		y_offset = data->boot_y_offset;
 		break;
 	case DISPLAY_ORIENTATION_ROTATED_270:
-		tx_data |= (ST7789V_MADCTL_MX_RIGHT_TO_LEFT |
+		/* Standard table: MY|MV (0xA0). */
+		tx_data |= (ST7789V_MADCTL_MY_BOTTOM_TO_TOP |
 			    ST7789V_MADCTL_MV_REVERSE_MODE);
 		x_offset = data->boot_y_offset;
 		y_offset = data->boot_x_offset;
