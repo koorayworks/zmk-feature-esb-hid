@@ -328,21 +328,29 @@ static int st7789v_set_pixel_format(const struct device *dev,
 
 /*
  * Per-orientation write-window margins (see the fork note at
- * the top of this file). The glass is one fixed rectangle in
- * GRAM — native cols 0..239, native rows 40..319 on this
- * module — so a margin pair depends only on which logical
- * axis is the long (320-line) one: y (RASET) for MV=0
+ * the top of this file). A margin pair depends only on which
+ * logical axis is the long (320-line) one: y (RASET) for MV=0
  * orientations, x (CASET) for MV=1 ones. Each orientation's
  * pair is its own named constant so hardware feedback can
  * tune one orientation without touching the others. All
  * values derive from the pristine DT offsets, keeping
  * set_orientation() idempotent: the short margin is the DT
- * x-offset (0), the long margin is the full GRAM slack,
- * 2 * boot_y_offset (the DT y-offset, 20, is only the
- * centred half-slack).
+ * x-offset (0), the long margin is the DT y-offset (20) —
+ * i.e. the window stays centred on the long axis, exactly
+ * the patternls-proven landscape configuration.
+ *
+ * History: a "glass sits at the far end of GRAM (rows
+ * 40..319)" model once set the long margin to the full
+ * slack, 2 * boot_y_offset = 40. Hardware check on
+ * 2026-11-07 refuted it: with 40 the image overshot and
+ * edge controls (ROTATE, BACK) were clipped by ~20 px on
+ * the far side, while at 20 the only casualty is the 1 px
+ * test frame sitting at the very glass edge (a line there
+ * is visible at an oblique angle, i.e. drawn but shadowed
+ * by the bezel/cover border). Centred is correct.
  */
 #define ST7789V_MARGIN_SHORT(data)	((data)->boot_x_offset)
-#define ST7789V_MARGIN_LONG(data)	(2U * (data)->boot_y_offset)
+#define ST7789V_MARGIN_LONG(data)	((data)->boot_y_offset)
 
 #define ST7789V_MARGIN_NORMAL_X(data)	ST7789V_MARGIN_SHORT(data)
 #define ST7789V_MARGIN_NORMAL_Y(data)	ST7789V_MARGIN_LONG(data)
