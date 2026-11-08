@@ -66,6 +66,20 @@ config ZMK_ESB_HID_STUDIO_RX
 	  ESB_HID_TYPE_STUDIO frames are written out to the CDC port.
 	  Requires the shield to provide the esb_studio_cdc node.
 
+config ZMK_ESB_HID_NOTIFY_RX
+	bool "Deck notification channel (receiver side)"
+	depends on ZMK_ESB_HID_RECEIVER
+	help
+	  Receive framed notifications from a PC-side notifier program
+	  over a dedicated USB CDC ACM port (devicetree node
+	  "deck_notify_cdc"), separate from the Studio forwarder port
+	  (deck-notifications-design.md). This is step M1, the channel
+	  skeleton: the forwarder answers HELLO with HELLO_ACK and
+	  drops everything else; NOTIFY/RESOLVE handling and the
+	  display UI arrive in later steps. Requires the shield to
+	  provide the deck_notify_cdc node; enable it in the
+	  production Deck (disptest) shield only.
+
 config ZMK_ESB_HID_RECEIVER
 	bool "HID over ESB receiver (ESB to USB HID)"
 	depends on SOC_SERIES_NRF52X || SOC_SERIES_NRF53X || SOC_SERIES_NRF54LX

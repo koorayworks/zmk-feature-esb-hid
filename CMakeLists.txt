@@ -28,6 +28,10 @@ if(CONFIG_ZMK_ESB_HID_STUDIO_RX)
   target_sources(app PRIVATE src/esb_hid_studio_rx.c)
 endif()
 
+if(CONFIG_ZMK_ESB_HID_NOTIFY_RX)
+  target_sources(app PRIVATE src/esb_hid_notify_rx.c)
+endif()
+
 # Forked ST7789V driver with runtime orientation support
 # (drivers/display/, Prospector-style zephyr_library_amend of the
 # stock Zephyr driver). Gated on the driver actually being built:
