@@ -55,7 +55,14 @@
  *   [0] slot 0..3, or ESB_HID_PAIR_SLOT_NOT_YET while the receiver has
  *       not confirmed a candidate yet
  *   [1] name_len
- *   [2..] candidate name captured at confirm time
+ *   [2..2+name_len) candidate name captured at confirm time
+ *   [2+name_len..2+name_len+8) OPTIONAL trailer: the receiver's own
+ *       hardware device ID (ESB_HID_DEVICE_ID_LEN bytes), present iff
+ *       the body is exactly 2 + name_len + ESB_HID_DEVICE_ID_LEN long.
+ *       Multi-receiver keyboards (ZMK_ESB_HID_MULTI_RECEIVER) store it
+ *       in their receiver profile list so they can tell their paired
+ *       receivers apart. Receivers without a readable ID omit it, and
+ *       keyboards with older firmware simply ignore the trailer.
  * The keyboard adopts the slot ONLY if the name equals its own device
  * name, so a stray assignment can never renumber the wrong device. */
 #define ESB_HID_TYPE_PAIR_ASSIGN 8

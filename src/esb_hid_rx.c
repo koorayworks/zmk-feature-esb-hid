@@ -17,6 +17,7 @@
  * <esb_hid.h>.
  */
 
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
@@ -268,6 +269,25 @@ static struct {
 static void pairing_timer_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(pairing_timer_work, pairing_timer_handler);
 
+/* Own hardware device ID (Zephyr hwinfo, nRF FICR DEVICEID), fetched
+ * lazily on first use and cached. own_id_len is ESB_HID_DEVICE_ID_LEN
+ * when a full ID is available, 0 otherwise. Appended to PAIR_ASSIGN
+ * payloads so multi-receiver keyboards can key their stored profile
+ * by receiver identity (see esb_hid_frame.h). */
+static uint8_t own_id[ESB_HID_DEVICE_ID_LEN];
+static uint8_t own_id_len;
+static bool own_id_fetched;
+
+static uint8_t fetch_own_id(void) {
+    if (!own_id_fetched) {
+        own_id_fetched = true;
+        ssize_t ret = hwinfo_get_device_id(own_id, sizeof(own_id));
+
+        own_id_len = (ret == ESB_HID_DEVICE_ID_LEN) ? ESB_HID_DEVICE_ID_LEN : 0;
+    }
+    return own_id_len;
+}
+
 /* Queue one PAIR_ASSIGN ACK payload on the pairing pipe. The ESB
  * stack keeps ACK payloads in a per-pipe FIFO and attaches the head
  * to the ACK of the next packet received on that pipe, so exactly one
@@ -280,8 +300,14 @@ static void pairing_load_payload(uint8_t slot, const char *name) {
         name_len = ESB_HID_NAME_MAX;
     }
 
+    /* Trailer: our own device ID, so the keyboard can store this
+     * assignment under this receiver's identity. Older keyboards
+     * ignore the extra bytes; if no full ID is readable the payload
+     * keeps its original (trailer-less) form. */
+    uint8_t id_len = fetch_own_id();
+
     struct esb_payload payload = {
-        .length = (uint8_t)(ESB_HID_FRAME_HDR_LEN + 2 + name_len),
+        .length = (uint8_t)(ESB_HID_FRAME_HDR_LEN + 2 + name_len + id_len),
         .pipe = ESB_HID_PAIRING_PIPE,
         .noack = 0,
     };
@@ -291,6 +317,9 @@ static void pairing_load_payload(uint8_t slot, const char *name) {
     payload.data[ESB_HID_FRAME_HDR_LEN + 1] = (uint8_t)name_len;
     if (name_len > 0) {
         memcpy(&payload.data[ESB_HID_FRAME_HDR_LEN + 2], name, name_len);
+    }
+    if (id_len > 0) {
+        memcpy(&payload.data[ESB_HID_FRAME_HDR_LEN + 2 + name_len], own_id, id_len);
     }
 
     int err = esb_write_payload(&payload);

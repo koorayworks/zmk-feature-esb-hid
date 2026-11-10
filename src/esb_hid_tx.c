@@ -163,19 +163,63 @@ static volatile bool resync_keyboard;
 static volatile bool resync_consumer;
 
 /* ------------------------------------------------------------------ */
-/* Slot assignment (step 2)                                            */
+/* Slot assignment and receiver profiles (step 2 + multi-receiver)     */
 
-/* Own slot = ESB pipe for all normal traffic. Resolved at link start
- * from the settings override ("esb_hid/slot", written when a receiver
- * assigns a slot during pairing) or CONFIG_ZMK_ESB_HID_SLOT. */
+/* Own slot = ESB pipe for all normal traffic, taken from the active
+ * receiver profile. Profiles are resolved once at link start from,
+ * in order of preference:
+ *  - the stored profile list ("esb_hid/receivers", written by
+ *    pairing; multi-receiver builds only), most recent first;
+ *  - the legacy settings override ("esb_hid/slot", written when a
+ *    receiver assigns a slot during pairing), as a single
+ *    unknown-identity profile;
+ *  - CONFIG_ZMK_ESB_HID_SLOT, likewise as a single profile.
+ * A setup with exactly one profile (everything that predates
+ * multi-receiver support) behaves exactly like the original
+ * single-slot TX: no hunting ever switches the pipe. */
 static uint8_t own_slot = CONFIG_ZMK_ESB_HID_SLOT;
 /* Pipe the next transmitted frame goes out on: own_slot normally,
- * ESB_HID_PAIRING_PIPE while pairing. Read by send_frame(). */
+ * ESB_HID_PAIRING_PIPE while pairing, the hunted candidate's slot
+ * while hunting. Read by send_frame(). */
 static volatile uint8_t tx_pipe = CONFIG_ZMK_ESB_HID_SLOT;
+
+/* Receiver profiles, most recently paired/confirmed first.
+ * active_profile indexes the profile in use; own_slot mirrors its
+ * slot. An all-zero rx_id means "identity unknown": the assignment
+ * came from a receiver whose firmware does not append its ID to
+ * PAIR_ASSIGN, or the profile predates multi-receiver support. All
+ * unknown-identity assignments share a single profile entry: without
+ * an ID there is no way to tell two such receivers apart. */
+#define ESB_HID_MAX_RECEIVERS 4
+
+struct esb_hid_receiver_profile {
+    uint8_t rx_id[ESB_HID_DEVICE_ID_LEN];
+    uint8_t slot;
+};
+
+static struct esb_hid_receiver_profile profiles[ESB_HID_MAX_RECEIVERS];
+static uint8_t profile_count = 1;
+static uint8_t active_profile;
+
+/* On-disk profile list ("esb_hid/receivers"). Explicit layout, not
+ * the RAM struct. */
+struct esb_hid_receivers_disk {
+    uint8_t version; /* = 1 */
+    uint8_t count;
+    struct {
+        uint8_t rx_id[ESB_HID_DEVICE_ID_LEN];
+        uint8_t slot;
+    } entries[ESB_HID_MAX_RECEIVERS];
+};
+
+BUILD_ASSERT(sizeof(struct esb_hid_receivers_disk) == 38,
+             "receivers disk format must be 38 bytes");
 
 #if IS_ENABLED(CONFIG_SETTINGS)
 static bool slot_override_valid;
 static uint8_t slot_override;
+static bool receivers_staged_valid;
+static struct esb_hid_receivers_disk receivers_staging;
 
 static int esb_hid_tx_settings_set(const char *name, size_t len, settings_read_cb read_cb,
                                    void *cb_arg) {
@@ -193,24 +237,177 @@ static int esb_hid_tx_settings_set(const char *name, size_t len, settings_read_c
         }
         return rc;
     }
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_MULTI_RECEIVER)
+    if (settings_name_steq(name, "receivers", &next) && !next) {
+        if (len != sizeof(receivers_staging)) {
+            return -EINVAL;
+        }
+        int rc = read_cb(cb_arg, &receivers_staging, sizeof(receivers_staging));
+
+        if (rc < 0) {
+            return rc;
+        }
+        if (receivers_staging.version != 1 || receivers_staging.count < 1 ||
+            receivers_staging.count > ESB_HID_MAX_RECEIVERS) {
+            return -EINVAL;
+        }
+        for (int i = 0; i < receivers_staging.count; i++) {
+            if (receivers_staging.entries[i].slot >= ESB_HID_SLOT_COUNT) {
+                return -EINVAL;
+            }
+        }
+        receivers_staged_valid = true;
+        return 0;
+    }
+#endif /* IS_ENABLED(CONFIG_ZMK_ESB_HID_MULTI_RECEIVER) */
     return -ENOENT;
 }
 
 SETTINGS_STATIC_HANDLER_DEFINE(esb_hid_tx, "esb_hid", NULL, esb_hid_tx_settings_set, NULL, NULL);
-#endif /* IS_ENABLED(CONFIG_SETTINGS) */
 
-static void resolve_own_slot(void) {
-#if IS_ENABLED(CONFIG_SETTINGS)
-    /* ZMK's main() already ran settings_load() once; load our subtree
-     * again here so the value is in place even if that ordering ever
-     * changes. Idempotent: the handler just re-reads the same key. */
-    settings_load_subtree("esb_hid");
-    if (slot_override_valid) {
-        own_slot = slot_override;
+/* Persist the profile list. The legacy "esb_hid/slot" key is always
+ * written as a downgrade mirror of the active slot, so firmware
+ * without multi-receiver support keeps using the most recently
+ * active slot. */
+static void profiles_save(void) {
+    int err;
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_MULTI_RECEIVER)
+    struct esb_hid_receivers_disk disk = {.version = 1, .count = profile_count};
+
+    for (int i = 0; i < profile_count; i++) {
+        memcpy(disk.entries[i].rx_id, profiles[i].rx_id, ESB_HID_DEVICE_ID_LEN);
+        disk.entries[i].slot = profiles[i].slot;
+    }
+    err = settings_save_one("esb_hid/receivers", &disk, sizeof(disk));
+    if (err) {
+        LOG_ERR("Failed to save receiver profiles: %d", err);
     }
 #endif
+    err = settings_save_one("esb_hid/slot", &own_slot, sizeof(own_slot));
+    if (err) {
+        LOG_ERR("Failed to save active slot: %d", err);
+    }
+}
+#else
+static void profiles_save(void) {}
+#endif /* IS_ENABLED(CONFIG_SETTINGS) */
+
+static void profiles_move_to_front(uint8_t idx) {
+    if (idx == 0 || idx >= profile_count) {
+        return;
+    }
+    struct esb_hid_receiver_profile tmp = profiles[idx];
+
+    memmove(&profiles[1], &profiles[0], idx * sizeof(profiles[0]));
+    profiles[0] = tmp;
+}
+
+/* Record a pairing assignment: the receiver identified by rx_id
+ * (NULL = identity unknown, e.g. an older receiver) assigned us
+ * `slot`. The matching entry is updated or a new one inserted, the
+ * entry moves to the front (most recent first) and becomes active.
+ * Inserting into a full list evicts the last entry, i.e. the least
+ * recently paired/confirmed receiver. Persists via profiles_save().
+ * Single-receiver builds keep exactly the legacy behaviour: the one
+ * profile is simply overwritten. */
+static void profiles_upsert(const uint8_t *rx_id, uint8_t slot) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_MULTI_RECEIVER)
+    int found = -1;
+
+    for (int i = 0; i < profile_count; i++) {
+        bool match;
+
+        if (rx_id != NULL) {
+            match = memcmp(profiles[i].rx_id, rx_id, ESB_HID_DEVICE_ID_LEN) == 0;
+        } else {
+            match = true;
+            for (int j = 0; j < ESB_HID_DEVICE_ID_LEN; j++) {
+                if (profiles[i].rx_id[j] != 0) {
+                    match = false;
+                    break;
+                }
+            }
+        }
+        if (match) {
+            found = i;
+            break;
+        }
+    }
+
+    if (found >= 0) {
+        profiles[found].slot = slot;
+        profiles_move_to_front((uint8_t)found);
+    } else {
+        uint8_t kept = profile_count < ESB_HID_MAX_RECEIVERS ? profile_count
+                                                             : ESB_HID_MAX_RECEIVERS - 1;
+
+        memmove(&profiles[1], &profiles[0], kept * sizeof(profiles[0]));
+        if (rx_id != NULL) {
+            memcpy(profiles[0].rx_id, rx_id, ESB_HID_DEVICE_ID_LEN);
+        } else {
+            memset(profiles[0].rx_id, 0, ESB_HID_DEVICE_ID_LEN);
+        }
+        profiles[0].slot = slot;
+        profile_count = kept + 1;
+    }
+#else
+    if (rx_id != NULL) {
+        memcpy(profiles[0].rx_id, rx_id, ESB_HID_DEVICE_ID_LEN);
+    } else {
+        memset(profiles[0].rx_id, 0, ESB_HID_DEVICE_ID_LEN);
+    }
+    profiles[0].slot = slot;
+    profile_count = 1;
+#endif
+    active_profile = 0;
+    own_slot = slot;
+    profiles_save();
+}
+
+static bool profiles_resolved;
+
+static void resolve_own_slot(void) {
+    if (profiles_resolved) {
+        /* Later link-start retries must not rebuild the list: the
+         * staged settings values only feed the first resolution,
+         * pairing/hunting state lives in the RAM copy. */
+        tx_pipe = own_slot;
+        return;
+    }
+    profiles_resolved = true;
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+    /* ZMK's main() already ran settings_load() once; load our subtree
+     * again here so the values are in place even if that ordering ever
+     * changes. Idempotent: the handler just re-reads the same keys. */
+    settings_load_subtree("esb_hid");
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_MULTI_RECEIVER) && IS_ENABLED(CONFIG_SETTINGS)
+    if (receivers_staged_valid) {
+        profile_count = receivers_staging.count;
+        for (int i = 0; i < profile_count; i++) {
+            memcpy(profiles[i].rx_id, receivers_staging.entries[i].rx_id,
+                   ESB_HID_DEVICE_ID_LEN);
+            profiles[i].slot = receivers_staging.entries[i].slot;
+        }
+    } else
+#endif
+    {
+        memset(profiles[0].rx_id, 0, ESB_HID_DEVICE_ID_LEN);
+#if IS_ENABLED(CONFIG_SETTINGS)
+        profiles[0].slot = slot_override_valid ? slot_override : CONFIG_ZMK_ESB_HID_SLOT;
+#else
+        profiles[0].slot = CONFIG_ZMK_ESB_HID_SLOT;
+#endif
+        profile_count = 1;
+    }
+    active_profile = 0;
+    own_slot = profiles[0].slot;
     tx_pipe = own_slot;
-    LOG_INF("esb_hid: TX slot %d, device name \"%s\"", own_slot, CONFIG_ZMK_ESB_HID_DEVICE_NAME);
+    LOG_INF("esb_hid: TX slot %d, device name \"%s\" (%d receiver profile(s))", own_slot,
+            CONFIG_ZMK_ESB_HID_DEVICE_NAME, profile_count);
 }
 
 /* Own device name as advertised on the wire: the Kconfig string
@@ -251,6 +448,11 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len);
 /* Pairing state (defined further below, next to the state machine). */
 static bool pairing_active;
 static void pairing_handle_assign(const uint8_t *body, size_t len);
+
+/* Receiver hunting state machine (defined further below, before
+ * send_frame). Pairing takes over the radio, so it cancels any
+ * hunt in progress. */
+static void hunt_cancel(void);
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
 /* Studio helpers (defined in the Studio section below). */
@@ -606,8 +808,10 @@ static void pairing_handle_assign(const uint8_t *body, size_t len) {
 
     uint8_t name_len = body[1];
 
-    if (name_len > len - 2) {
-        name_len = (uint8_t)(len - 2);
+    if (name_len > ESB_HID_NAME_MAX || len < (size_t)(2 + name_len)) {
+        LOG_WRN("Pairing: ignoring malformed assignment (len %d, name_len %d)", (int)len,
+                name_len);
+        return;
     }
 
     char mine[ESB_HID_NAME_MAX + 1];
@@ -619,16 +823,26 @@ static void pairing_handle_assign(const uint8_t *body, size_t len) {
         return;
     }
 
-    own_slot = slot;
-#if IS_ENABLED(CONFIG_SETTINGS)
-    int err = settings_save_one("esb_hid/slot", &own_slot, sizeof(own_slot));
+    /* Optional trailer: the assigning receiver's own device ID,
+     * present iff exactly ESB_HID_DEVICE_ID_LEN bytes follow the
+     * name (see esb_hid_frame.h). Older receivers append nothing and
+     * the profile is recorded with an unknown identity. */
+    const uint8_t *rx_id = NULL;
 
-    if (err) {
-        LOG_ERR("Pairing: failed to save assigned slot: %d", err);
+    if (len - (2 + name_len) == ESB_HID_DEVICE_ID_LEN) {
+        rx_id = &body[2 + name_len];
     }
-#endif
+
+    profiles_upsert(rx_id, slot);
     pairing_exit();
-    LOG_INF("Pairing: assigned slot %d for \"%s\", saved to settings", slot, mine);
+    if (rx_id != NULL) {
+        LOG_INF("Pairing: assigned slot %d for \"%s\" (receiver ID known, %d profile(s)), saved "
+                "to settings",
+                slot, mine, profile_count);
+    } else {
+        LOG_INF("Pairing: assigned slot %d for \"%s\" (receiver ID unknown), saved to settings",
+                slot, mine);
+    }
 }
 
 int esb_hid_tx_start_pairing(void) {
@@ -640,6 +854,7 @@ int esb_hid_tx_start_pairing(void) {
     }
 
     pairing_active = true;
+    hunt_cancel();
     pairing_deadline_ms = k_uptime_get() + ESB_HID_PAIRING_DURATION_MS;
     tx_pipe = ESB_HID_PAIRING_PIPE;
     k_work_reschedule(&pairing_work, K_NO_WAIT);
@@ -682,7 +897,161 @@ int zmk_esb_hid_send_mouse_report(struct zmk_hid_mouse_report_body *body) {
 }
 #endif /* IS_ENABLED(CONFIG_ZMK_POINTING) */
 
-static void send_frame(const struct esb_hid_frame *frame) {
+/* ------------------------------------------------------------------ */
+/* Link monitor and receiver hunting (multi-receiver)                  */
+
+/* Presence is judged by status frames only: they flow on the 5 s
+ * heartbeat even while the user is idle, whereas key/mouse frames
+ * can fail in bursts for unrelated reasons (queue pressure, one
+ * noisy moment) and must not trigger a receiver switch on their
+ * own. A receiver is declared gone after this many consecutive
+ * failed status sends, which also bounds the detection time to
+ * roughly 15 s -- the same order as the receiver's own link-lost
+ * timeout (ESB_HID_LINK_LOST_TIMEOUT_MS). */
+#define ESB_HID_LINK_FAIL_THRESHOLD 3
+/* While hunting, one pass probes every profile once; passes repeat
+ * at most this often, with a short gap between two candidates, so
+ * having no known receiver around costs a handful of tiny frames
+ * every few seconds. */
+#define ESB_HID_HUNT_CYCLE_MS 3000
+#define ESB_HID_HUNT_PROBE_GAP_MS 200
+
+static bool link_up; /* the active profile's receiver is ACKing */
+static uint8_t status_fail_streak;
+static bool hunting;
+static uint8_t hunt_candidate;  /* profile index being probed */
+static uint8_t hunt_pass_start; /* first candidate of the current pass */
+static bool hunt_pass_done;     /* rotation wrapped; waiting out the cycle */
+static int64_t hunt_next_probe_ms;
+static int64_t hunt_cycle_end_ms;
+
+static void hunt_set_candidate(uint8_t idx) {
+    hunt_candidate = idx;
+    tx_pipe = profiles[idx].slot;
+}
+
+/* Start a hunt pass over all profiles. include_active (boot: nothing
+ * has been confirmed yet) starts the rotation at the active profile;
+ * on link loss the just-lost profile is probed last instead. */
+static void hunt_start(bool include_active) {
+    if (profile_count < 2 || pairing_active) {
+        return;
+    }
+    int64_t now = k_uptime_get();
+
+    hunting = true;
+    hunt_pass_done = false;
+    hunt_pass_start = include_active ? active_profile
+                                     : (uint8_t)((active_profile + 1) % profile_count);
+    hunt_cycle_end_ms = now + ESB_HID_HUNT_CYCLE_MS;
+    hunt_next_probe_ms = 0; /* first probe immediately */
+    hunt_set_candidate(hunt_pass_start);
+    LOG_INF("ESB link: hunting for a known receiver (%d profiles)", profile_count);
+}
+
+static void hunt_cancel(void) {
+    hunting = false;
+    status_fail_streak = 0;
+}
+
+/* The hunted candidate answered: make its profile active (moved to
+ * the front, so it is probed first next time) and push the current
+ * absolute state to it -- it may be a different receiver than the
+ * one that saw the earlier reports. */
+static void hunt_confirm(void) {
+    uint8_t found = hunt_candidate;
+    bool reordered = (found != 0);
+
+    hunting = false;
+    link_up = true;
+    status_fail_streak = 0;
+    profiles_move_to_front(found);
+    active_profile = 0;
+    own_slot = profiles[0].slot;
+    tx_pipe = own_slot;
+    if (reordered) {
+        profiles_save();
+    }
+    resync_keyboard = true;
+    resync_consumer = true;
+    LOG_INF("ESB link: receiver found (slot %d), link up", own_slot);
+    send_status_snapshot();
+}
+
+/* Advance the rotation after an unanswered status frame. */
+static void hunt_note_miss(int64_t now) {
+    uint8_t next = (uint8_t)((hunt_candidate + 1) % profile_count);
+
+    if (next == hunt_pass_start) {
+        /* Rotation wrapped: the pass is over. Wait out the rest of
+         * the cycle before probing again. */
+        hunt_pass_done = true;
+        hunt_next_probe_ms = hunt_cycle_end_ms;
+        return;
+    }
+    hunt_set_candidate(next);
+    hunt_next_probe_ms = now + ESB_HID_HUNT_PROBE_GAP_MS;
+}
+
+/* Feed one finished send into the link state machine. Called from
+ * the TX thread after send_frame(): true means the receiver ACKed. */
+static void link_monitor(uint8_t type, bool ok) {
+    if (ok) {
+        status_fail_streak = 0;
+        if (hunting) {
+            hunt_confirm();
+        } else {
+            link_up = true;
+        }
+        return;
+    }
+
+    if (type != ESB_HID_TYPE_STATUS) {
+        return;
+    }
+
+    if (hunting) {
+        if (!hunt_pass_done) {
+            hunt_note_miss(k_uptime_get());
+        }
+        return;
+    }
+
+    if (++status_fail_streak >= ESB_HID_LINK_FAIL_THRESHOLD) {
+        status_fail_streak = 0;
+        if (link_up) {
+            LOG_INF("ESB link: receiver stopped answering, link down");
+        }
+        link_up = false;
+        hunt_start(false);
+    }
+}
+
+/* Drive the hunt from the TX thread: send the status snapshot as
+ * the probe for the current candidate and pace the passes. The
+ * probe's result comes back through link_monitor(). */
+static void hunt_tick(void) {
+    if (!hunting || pairing_active) {
+        return;
+    }
+    int64_t now = k_uptime_get();
+
+    if (now < hunt_next_probe_ms) {
+        return;
+    }
+    if (hunt_pass_done) {
+        /* A new cycle begins: start the next pass at the front
+         * profile (the most recently confirmed one). */
+        hunt_pass_done = false;
+        hunt_pass_start = 0;
+        hunt_cycle_end_ms = now + ESB_HID_HUNT_CYCLE_MS;
+        hunt_set_candidate(0);
+    }
+    send_status_snapshot();
+    hunt_next_probe_ms = now + ESB_HID_HUNT_PROBE_GAP_MS;
+}
+
+static bool send_frame(const struct esb_hid_frame *frame) {
     struct esb_payload payload = {
         .length = frame->len + ESB_HID_FRAME_HDR_LEN,
         .pipe = tx_pipe,
@@ -713,10 +1082,10 @@ static void send_frame(const struct esb_hid_frame *frame) {
         }
         if (err) {
             LOG_WRN("esb_write_payload failed: %d", err);
-            return;
+            return false;
         }
         if (k_sem_take(&tx_done_sem, K_MSEC(50)) == 0 && tx_last_ok) {
-            return;
+            return true;
         }
         /* The attempt failed (or timed out). The ESB library removes a
          * payload from the TX FIFO only on TX success; a failed one
@@ -731,6 +1100,7 @@ static void send_frame(const struct esb_hid_frame *frame) {
         esb_pop_tx();
     }
     LOG_WRN("ESB TX failed (type %d)", frame->type);
+    return false;
 }
 
 static void tx_thread(void) {
@@ -751,14 +1121,18 @@ static void tx_thread(void) {
              * re-sent after pairing via the resync mechanism / the
              * next change event anyway). */
             if (!pairing_active || frame.type == ESB_HID_TYPE_PAIR_REQUEST) {
-                send_frame(&frame);
+                bool sent_ok = send_frame(&frame);
+
+                link_monitor(frame.type, sent_ok);
             }
             /* A successful send may have carried an ACK payload. */
             drain_ack_payloads();
+            hunt_tick();
             continue;
         }
 
         drain_ack_payloads();
+        hunt_tick();
 #if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
         if (link_ready && !pairing_active) {
             studio_maybe_poll();
@@ -806,6 +1180,11 @@ static void link_retry(struct k_work *work) {
     }
 
     link_ready = true;
+    /* With several known receivers, find out which one is actually
+     * around before settling: probe them in rotation, starting from
+     * the most recently confirmed one. A single profile skips this
+     * entirely (legacy behaviour). */
+    hunt_start(true);
     /* The endpoint layer evaluated transports at boot, when the ESB
      * link was not ready yet, and nothing re-triggers it (no USB/BLE
      * state events in this build). Ask it to re-evaluate now, or key

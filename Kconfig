@@ -22,7 +22,9 @@ config ZMK_ESB_HID
 	  (ZMK_TRANSPORT_ESB in endpoints).
 
 	  SETTINGS/NVS hold the paired slot override ("esb_hid/slot"),
-	  written when the receiver assigns a slot during pairing.
+	  written when the receiver assigns a slot during pairing, and
+	  the receiver profile list ("esb_hid/receivers") used by
+	  multi-receiver support (ZMK_ESB_HID_MULTI_RECEIVER).
 
 config ZMK_ESB_HID_SLOT
 	int "ESB slot (pipe) this keyboard uses by default"
@@ -33,6 +35,23 @@ config ZMK_ESB_HID_SLOT
 	  Slot 0..3 = ESB pipe the keyboard transmits on. A slot assigned
 	  during pairing is stored in settings ("esb_hid/slot") and takes
 	  precedence over this build-time default.
+
+config ZMK_ESB_HID_MULTI_RECEIVER
+	bool "Remember multiple receivers and auto-select between them (keyboard side)"
+	depends on ZMK_ESB_HID
+	default y
+	help
+	  Store one profile per paired receiver ("esb_hid/receivers":
+	  the receiver's hardware device ID plus the slot it assigned)
+	  instead of a single slot, and hunt for the receiver that is
+	  actually in range: at boot and whenever the link is lost, the
+	  keyboard probes its known receivers in rotation and settles on
+	  the first one that ACKs. This is what lets the same keyboard
+	  work with the home receiver at home and the office receiver at
+	  the office without re-pairing. Receivers append their device
+	  ID to PAIR_ASSIGN; assignments from older receivers are kept
+	  as a single unknown-identity profile. With only one known
+	  receiver the behaviour is identical to the single-slot mode.
 
 config ZMK_ESB_HID_DEVICE_NAME
 	string "Device name advertised over ESB"
