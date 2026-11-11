@@ -116,3 +116,17 @@ config ZMK_ESB_HID_RECEIVER
 
 	  SETTINGS/NVS hold the slot registry ("esb_hid/registry"): which
 	  slots are paired, their device names, and the active slot.
+
+config ZMK_ESB_HID_RX_BOOT_PAIRING
+	bool "Open the pairing window automatically at boot (headless receiver)"
+	depends on ZMK_ESB_HID_RECEIVER
+	help
+	  For receivers without a display UI there is no other way to
+	  open the pairing window, so open it automatically once the
+	  ESB link is up: the first free slot is targeted and the first
+	  candidate that asks is assigned without a manual confirm.
+	  The window is the usual 60 s pairing window; once a keyboard
+	  is registered the receiver behaves exactly like a UI-driven
+	  one. Only enable this on headless receivers — a receiver
+	  with a UI (the Deck) should keep pairing under explicit
+	  user control.

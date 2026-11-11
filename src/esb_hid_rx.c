@@ -377,6 +377,22 @@ static void pairing_finalize(void) {
     LOG_INF("Pairing: slot %d registered to \"%s\"", pairing.target_slot, pairing.candidate_name);
 }
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING)
+/* Set while the pairing window that was opened automatically at
+ * boot (headless receiver) is live: its first candidate is assigned
+ * without a manual confirm step. */
+static bool boot_pairing_armed;
+#endif
+
+/* Caller holds esb_hid_rx_mutex and pairing.state ==
+ * ESB_HID_PAIRING_CANDIDATE. */
+static void pairing_confirm_locked(void) {
+    pairing.state = ESB_HID_PAIRING_ASSIGNING;
+    pairing.assigning_since_ms = k_uptime_get();
+    pairing_load_payload(pairing.target_slot, pairing.candidate_name);
+    LOG_INF("Pairing: assigning slot %d to \"%s\"", pairing.target_slot, pairing.candidate_name);
+}
+
 static void pairing_timer_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
@@ -473,6 +489,14 @@ static void pairing_on_request(const uint8_t *body, size_t len) {
             LOG_INF("Pairing: candidate \"%s\" for slot %d", pairing.candidate_name,
                     pairing.target_slot);
         }
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING)
+        if (boot_pairing_armed) {
+            /* Headless boot window: there is no UI to confirm with,
+             * so the first candidate is assigned immediately. */
+            pairing_confirm_locked();
+            return;
+        }
+#endif
         /* Sentinel reload: tell the keyboard "not yet". */
         pairing_load_payload(ESB_HID_PAIR_SLOT_NOT_YET, NULL);
     } else if (pairing.state == ESB_HID_PAIRING_ASSIGNING) {
@@ -535,12 +559,8 @@ int esb_hid_pairing_confirm(void) {
         return -EINVAL;
     }
 
-    pairing.state = ESB_HID_PAIRING_ASSIGNING;
-    pairing.assigning_since_ms = k_uptime_get();
-    pairing_load_payload(pairing.target_slot, pairing.candidate_name);
+    pairing_confirm_locked();
     k_mutex_unlock(&esb_hid_rx_mutex);
-
-    LOG_INF("Pairing: assigning slot %d to \"%s\"", pairing.target_slot, pairing.candidate_name);
     return 0;
 }
 
@@ -554,6 +574,35 @@ void esb_hid_pairing_cancel(void) {
     k_mutex_unlock(&esb_hid_rx_mutex);
     LOG_INF("Pairing: cancelled");
 }
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING)
+/* Headless receivers have no UI to open the pairing window with, so
+ * open it once the link is up: target the first free slot; if every
+ * slot is already registered there is nothing to do. Runs on the
+ * first successful link start only. */
+static void boot_pairing_maybe_open(void) {
+    static bool attempted;
+
+    if (attempted) {
+        return;
+    }
+    attempted = true;
+
+    for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+        if (!registry.slots[i].used) {
+            boot_pairing_armed = true;
+            if (esb_hid_pairing_open(i) == 0) {
+                LOG_INF("Pairing: boot window opened for free slot %d (headless, auto-assign)",
+                        i);
+            } else {
+                boot_pairing_armed = false;
+            }
+            return;
+        }
+    }
+    LOG_INF("Pairing: all slots registered, no boot window (headless)");
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Public slot API                                                     */
@@ -1003,6 +1052,11 @@ static void rx_link_retry(struct k_work *work) {
         LOG_ERR("ESB RX link start failed: %d (retry in 5s)", err);
         k_work_reschedule(&rx_link_retry_work, K_SECONDS(5));
     }
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING)
+    if (!err) {
+        boot_pairing_maybe_open();
+    }
+#endif
 }
 
 static int esb_hid_rx_init(void) {
