@@ -489,10 +489,12 @@ static void pairing_on_request(const uint8_t *body, size_t len) {
             LOG_INF("Pairing: candidate \"%s\" for slot %d", pairing.candidate_name,
                     pairing.target_slot);
         }
-#if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING)
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING_AUTO)
         if (boot_pairing_armed) {
-            /* Headless boot window: there is no UI to confirm with,
-             * so the first candidate is assigned immediately. */
+            /* Boot window in auto mode (headless): there is no UI
+             * to confirm with, so the first candidate is assigned
+             * immediately. With a UI (AUTO off) the candidate just
+             * stays pending until the UI confirms it. */
             pairing_confirm_locked();
             return;
         }
@@ -592,8 +594,10 @@ static void boot_pairing_maybe_open(void) {
         if (!registry.slots[i].used) {
             boot_pairing_armed = true;
             if (esb_hid_pairing_open(i) == 0) {
-                LOG_INF("Pairing: boot window opened for free slot %d (headless, auto-assign)",
-                        i);
+                LOG_INF("Pairing: boot window opened for free slot %d (%s)", i,
+                        IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING_AUTO)
+                            ? "auto-assign"
+                            : "waiting for on-device confirm");
             } else {
                 boot_pairing_armed = false;
             }

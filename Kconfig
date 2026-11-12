@@ -130,3 +130,15 @@ config ZMK_ESB_HID_RX_BOOT_PAIRING
 	  one. Only enable this on headless receivers — a receiver
 	  with a UI (the Deck) should keep pairing under explicit
 	  user control.
+
+config ZMK_ESB_HID_RX_BOOT_PAIRING_AUTO
+	bool "Auto-assign the first candidate in the boot pairing window"
+	depends on ZMK_ESB_HID_RX_BOOT_PAIRING
+	help
+	  Assign the first candidate that asks in the boot pairing
+	  window, with no confirmation step. This is the right mode
+	  for headless receivers, which have no way to ask the user.
+	  Display-equipped receivers should leave this off: the
+	  window still opens at boot, but assignment then waits for
+	  esb_hid_pairing_confirm() from the UI, so an accidental
+	  pairing request cannot claim a slot silently.
