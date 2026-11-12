@@ -125,6 +125,9 @@ config ZMK_ESB_HID_RX_BOOT_PAIRING
 	  open the pairing window, so open it automatically once the
 	  ESB link is up: the first free slot is targeted and the first
 	  candidate that asks is assigned without a manual confirm.
+	  The decision is taken about 10 s after the link comes up,
+	  and no window opens at all if the keyboard this receiver
+	  was last used with has already been heard by then.
 	  The window is the usual 60 s pairing window; once a keyboard
 	  is registered the receiver behaves exactly like a UI-driven
 	  one. Only enable this on headless receivers — a receiver

@@ -253,6 +253,9 @@ uint8_t esb_hid_rx_studio_pipe(void) { return registry.active_slot; }
  * did not adopt (e.g. name mismatch): fall back to CANDIDATE. */
 #define ESB_HID_PAIRING_ASSIGN_GIVEUP_MS 10000
 #define ESB_HID_PAIRING_TIMER_PERIOD_MS 250
+/* Boot window decision delay after link start: long enough for the
+ * previously active keyboard's 5 s status heartbeat to land twice. */
+#define ESB_HID_BOOT_PAIRING_DELAY_MS 10000
 
 static struct {
     enum esb_hid_pairing_state state;
@@ -580,8 +583,11 @@ void esb_hid_pairing_cancel(void) {
 #if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING)
 /* Headless receivers have no UI to open the pairing window with, so
  * open it once the link is up: target the first free slot; if every
- * slot is already registered there is nothing to do. Runs on the
- * first successful link start only. */
+ * slot is already registered there is nothing to do. The decision is
+ * deferred (ESB_HID_BOOT_PAIRING_DELAY_MS after link start) and is
+ * skipped entirely when the keyboard this receiver was last used
+ * with is already on the air: that is a normal power-on, not a
+ * pairing situation. Runs once. */
 static void boot_pairing_maybe_open(void) {
     static bool attempted;
 
@@ -589,6 +595,12 @@ static void boot_pairing_maybe_open(void) {
         return;
     }
     attempted = true;
+
+    if (registry.active_slot < ESB_HID_SLOT_COUNT &&
+        peers[registry.active_slot].last_seen_ms != 0) {
+        LOG_INF("Pairing: active keyboard already on air, no boot window");
+        return;
+    }
 
     for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
         if (!registry.slots[i].used) {
@@ -606,6 +618,13 @@ static void boot_pairing_maybe_open(void) {
     }
     LOG_INF("Pairing: all slots registered, no boot window (headless)");
 }
+
+static void boot_pairing_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    boot_pairing_maybe_open();
+}
+
+static K_WORK_DELAYABLE_DEFINE(boot_pairing_work, boot_pairing_work_handler);
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1058,7 +1077,10 @@ static void rx_link_retry(struct k_work *work) {
     }
 #if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING)
     if (!err) {
-        boot_pairing_maybe_open();
+        /* Defer the boot window decision a little: the keyboard this
+         * receiver was last used with gets a chance to show up first,
+         * and if it does, no window opens at all. */
+        k_work_reschedule(&boot_pairing_work, K_MSEC(ESB_HID_BOOT_PAIRING_DELAY_MS));
     }
 #endif
 }
