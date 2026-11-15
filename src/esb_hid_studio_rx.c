@@ -28,6 +28,13 @@
  *   ACK payloads queued in the radio are all dropped. The purge runs
  *   in the ACK loader thread, which owns the downlink ring buffer
  *   claims and is the only caller of esb_write_payload() here.
+ *
+ *   Session resync: a fragment can still be in flight over ESB while
+ *   the flush runs and land in the uplink queue after it; its bytes
+ *   (typically a lone trailing EOF) would head the next session's
+ *   stream. The CDC out thread therefore drops bytes after boot and
+ *   after every flush until the first SOF (0xAB) of a framed message
+ *   has been forwarded.
  */
 
 #include <zephyr/device.h>
@@ -63,6 +70,21 @@ struct esb_studio_up_chunk {
 };
 
 K_MSGQ_DEFINE(esb_studio_up_queue, sizeof(struct esb_studio_up_chunk), 16, 4);
+
+/* ZMK Studio framing start-of-frame byte (FRAMING_SOF in the Studio
+ * core). A framed stream always begins with it. */
+#define ESB_HID_STUDIO_SOF_BYTE 0xAB
+
+/* Session resync: fragments of a dead session can still be in flight
+ * over ESB when the session flush runs; they land in the up-queue
+ * afterwards and would be the first bytes the next client reads. A
+ * lone trailing EOF (0xAD) is the common case, and strict framing
+ * decoders abort the connection on a non-SOF first byte. So after
+ * boot and after every session flush, the CDC out thread drops bytes
+ * until the first SOF has been forwarded — the same idle-state
+ * behaviour as the reference framing decoder. A live session is
+ * unaffected: its stream starts with SOF by definition. */
+static volatile bool studio_await_sof = true;
 
 void esb_hid_studio_fwd_to_pc(const uint8_t *data, size_t len) {
     struct esb_studio_up_chunk chunk;
@@ -142,6 +164,7 @@ void esb_hid_studio_fwd_flush_session(void) {
 static void esb_studio_do_flush(void) {
     ring_buf_reset(&esb_studio_down_buf);
     k_msgq_purge(&esb_studio_up_queue);
+    studio_await_sof = true;
     hint_replenish_armed = true;
 
     int err = esb_stop_rx();
@@ -303,6 +326,14 @@ static void esb_studio_cdc_out_thread(void) {
     while (1) {
         k_msgq_get(&esb_studio_up_queue, &chunk, K_FOREVER);
         for (int i = 0; i < chunk.len; i++) {
+            if (studio_await_sof) {
+                if (chunk.data[i] != ESB_HID_STUDIO_SOF_BYTE) {
+                    /* Stale byte from a dead session: drop it. */
+                    continue;
+                }
+                studio_await_sof = false;
+                LOG_INF("Studio uplink resynced (first SOF forwarded)");
+            }
             uart_poll_out(cdc_dev, chunk.data[i]);
         }
     }
