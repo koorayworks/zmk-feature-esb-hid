@@ -29,6 +29,7 @@ struct esb_hid_slot_info {
     char layer_name[ESB_HID_LAYER_NAME_MAX + 1];
     bool status_valid;
     uint8_t battery; /* 0-100, 0xFF = unknown */
+    uint8_t battery_peer; /* split peer battery, 0xFF = unknown / not split */
     uint8_t layer;
     uint8_t output; /* ESB_HID_STATUS_OUTPUT_* */
     bool link_up;

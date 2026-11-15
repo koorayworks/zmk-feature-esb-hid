@@ -727,6 +727,7 @@ int esb_hid_rx_get_slot_info(uint8_t slot, struct esb_hid_slot_info *out) {
     }
     out->status_valid = peers[slot].status.valid;
     out->battery = peers[slot].status.valid ? peers[slot].status.battery : 0xFF;
+    out->battery_peer = peers[slot].status.valid ? peers[slot].status.battery_peer : 0xFF;
     out->layer = peers[slot].status.layer;
     out->output = peers[slot].status.output;
     if (peers[slot].last_seen_ms == 0) {
@@ -774,7 +775,8 @@ static void handle_status(uint8_t slot, const uint8_t *data, size_t len) {
 
     /* Status v2 name trailer: [name_len][name] after the fixed body.
      * Status v3 layer-name trailer: [layer_name_len][layer_name]
-     * after the v2 name trailer. */
+     * after the v2 name trailer. Status v4 peer battery trailer:
+     * 1 byte after the layer-name trailer. */
     char name[ESB_HID_NAME_MAX + 1] = "";
     char layer_name[ESB_HID_LAYER_NAME_MAX + 1] = "";
     size_t trailer_offset = sizeof(struct esb_hid_status_body);
@@ -798,7 +800,8 @@ static void handle_status(uint8_t slot, const uint8_t *data, size_t len) {
     }
 
     if (body->proto_version >= 3 && trailer_offset < len) {
-        size_t layer_name_len = data[trailer_offset];
+        size_t wire_layer_name_len = data[trailer_offset];
+        size_t layer_name_len = wire_layer_name_len;
 
         if (layer_name_len > len - trailer_offset - 1) {
             layer_name_len = len - trailer_offset - 1;
@@ -808,9 +811,22 @@ static void handle_status(uint8_t slot, const uint8_t *data, size_t len) {
         }
         memcpy(layer_name, &data[trailer_offset + 1], layer_name_len);
         layer_name[layer_name_len] = '\0';
+        trailer_offset += 1 + wire_layer_name_len;
+        if (trailer_offset > len) {
+            trailer_offset = len;
+        }
+    }
+
+    /* Status v4 peer battery trailer: the split peer's state of
+     * charge, ESB_HID_BATTERY_UNKNOWN when not split / unknown. */
+    uint8_t battery_peer = ESB_HID_BATTERY_UNKNOWN;
+
+    if (body->proto_version >= 4 && trailer_offset < len) {
+        battery_peer = data[trailer_offset];
     }
 
     if (!peer->status.valid || peer->status.battery != body->battery ||
+        peer->status.battery_peer != battery_peer ||
         peer->status.layer != body->layer || peer->status.output != output ||
         strcmp(peer->status.name, name) != 0 ||
         strcmp(peer->status.layer_name, layer_name) != 0) {
@@ -824,6 +840,7 @@ static void handle_status(uint8_t slot, const uint8_t *data, size_t len) {
     }
 
     peer->status.battery = body->battery;
+    peer->status.battery_peer = battery_peer;
     peer->status.layer = body->layer;
     peer->status.flags = body->flags;
     peer->status.output = output;

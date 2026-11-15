@@ -39,6 +39,8 @@
 
 struct esb_hid_device_status {
     uint8_t battery; /* 0-100 %, 0xFF = unknown */
+    uint8_t battery_peer; /* split peer (other half) battery from status
+                             v4 frames; 0xFF = unknown / not split */
     uint8_t layer;
     uint8_t flags;
     uint8_t output; /* ESB_HID_STATUS_OUTPUT_* decoded from flags */

@@ -605,6 +605,13 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len) {
  * status frame is itself retried by send_frame(). */
 static uint8_t status_boot_countdown = 3;
 
+/* Latest battery level of the split peer (the other half), learned
+ * from zmk_peripheral_battery_state_changed events; carried in the
+ * status v4 peer trailer. Stays ESB_HID_BATTERY_UNKNOWN on non-split
+ * keyboards. With more than one peripheral the most recent report
+ * wins (typical split keyboards have exactly one). */
+static uint8_t status_peer_battery = ESB_HID_BATTERY_UNKNOWN;
+
 /* Encode the currently selected HID output transport into the status
  * flags field. Status frames are sent over ESB no matter which output
  * is selected, so without this the receiver cannot tell that e.g. the
@@ -650,9 +657,10 @@ static void send_status_snapshot(void) {
      * 4-byte v1 body. Status v3: append the [layer_name_len]
      * [layer_name] trailer after the v2 name trailer. Layer names
      * are ASCII display-names, so truncating to
-     * ESB_HID_LAYER_NAME_MAX bytes is fine.
-     * Frame buffer sizing: 4 + 1+16 + 1+16 = 38 body bytes max. */
-    uint8_t frame_body[sizeof(body) + 1 + ESB_HID_NAME_MAX + 1 + ESB_HID_LAYER_NAME_MAX];
+     * ESB_HID_LAYER_NAME_MAX bytes is fine. Status v4: append the
+     * 1-byte peer battery after the layer-name trailer.
+     * Frame buffer sizing: 4 + 1+16 + 1+16 + 1 = 39 body bytes max. */
+    uint8_t frame_body[sizeof(body) + 1 + ESB_HID_NAME_MAX + 1 + ESB_HID_LAYER_NAME_MAX + 1];
     char name[ESB_HID_NAME_MAX + 1];
     size_t name_len = own_name(name);
 
@@ -670,9 +678,10 @@ static void send_status_snapshot(void) {
     if (layer_name_len > 0) {
         memcpy(&frame_body[sizeof(body) + 1 + name_len + 1], layer_name_str, layer_name_len);
     }
+    frame_body[sizeof(body) + 1 + name_len + 1 + layer_name_len] = status_peer_battery;
 
     enqueue_report(ESB_HID_TYPE_STATUS, frame_body,
-                   sizeof(body) + 1 + name_len + 1 + layer_name_len);
+                   sizeof(body) + 1 + name_len + 1 + layer_name_len + 1);
 }
 
 static void status_heartbeat(struct k_work *work) {
@@ -686,6 +695,13 @@ static K_WORK_DELAYABLE_DEFINE(status_work, status_heartbeat);
 static int esb_hid_tx_listener(const zmk_event_t *eh) {
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
     if (as_zmk_battery_state_changed(eh) != NULL) {
+        send_status_snapshot();
+        return 0;
+    }
+    const struct zmk_peripheral_battery_state_changed *peer_batt =
+        as_zmk_peripheral_battery_state_changed(eh);
+    if (peer_batt != NULL) {
+        status_peer_battery = peer_batt->state_of_charge;
         send_status_snapshot();
         return 0;
     }
@@ -709,6 +725,7 @@ ZMK_SUBSCRIPTION(esb_hid_tx, zmk_layer_state_changed);
 ZMK_SUBSCRIPTION(esb_hid_tx, zmk_endpoint_changed);
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
 ZMK_SUBSCRIPTION(esb_hid_tx, zmk_battery_state_changed);
+ZMK_SUBSCRIPTION(esb_hid_tx, zmk_peripheral_battery_state_changed);
 #endif
 
 /* ------------------------------------------------------------------ */

@@ -115,8 +115,14 @@
  * appended after the v2 name trailer:
  * [layer_name_len][layer_name bytes], layer name truncated to
  * ESB_HID_LAYER_NAME_MAX bytes. v1/v2 frames are still accepted,
- * with an empty layer name. */
-#define ESB_HID_PROTOCOL_VERSION 3
+ * with an empty layer name.
+ * Status protocol v4: proto_version = 4 and a 1-byte peer battery
+ * trailer appended after the v3 layer-name trailer: the state of
+ * charge of the keyboard's split peer (the other half), as last
+ * reported to the central, or ESB_HID_BATTERY_UNKNOWN when the
+ * keyboard is not split or the peer level is unknown. v1-v3 frames
+ * are still accepted, with an unknown peer battery. */
+#define ESB_HID_PROTOCOL_VERSION 4
 
 struct esb_hid_status_body {
     uint8_t battery;       /* 0-100 %, ESB_HID_BATTERY_UNKNOWN if unavailable */
