@@ -66,7 +66,26 @@
  * The keyboard adopts the slot ONLY if the name equals its own device
  * name, so a stray assignment can never renumber the wrong device. */
 #define ESB_HID_TYPE_PAIR_ASSIGN 8
-#define ESB_HID_TYPE_COUNT 9
+/* Slot identity (RX->TX, ACK payloads only, never a regular uplink
+ * frame). Body:
+ *   [0] flags: bit0 (ESB_HID_SLOT_IDENTITY_REGISTERED) set when the
+ *       pipe this payload rides on belongs to a registered slot
+ *   [1..9) the hardware device ID registered at that slot
+ *       (ESB_HID_DEVICE_ID_LEN bytes; all zero for legacy slots whose
+ *       registration predates pairing proto v2 — the keyboard must
+ *       treat that as "cannot judge", not as a mismatch)
+ * The receiver periodically tells each connected keyboard which device
+ * it believes is registered on that pipe, so a keyboard holding a
+ * stale receiver profile (receiver-side registry was deleted, moved
+ * or migrated without it) can detect the desync and drop the profile
+ * instead of silently talking to a slot that no longer maps to it.
+ * Keyboards with older firmware ignore this type; receivers with
+ * older firmware never send it, and its ABSENCE must never be treated
+ * as a mismatch. See DESIGN.md "SLOT_IDENTITY" (2026-11-15). */
+#define ESB_HID_TYPE_SLOT_IDENTITY 9
+#define ESB_HID_TYPE_COUNT 10
+
+#define ESB_HID_SLOT_IDENTITY_REGISTERED 0x01
 
 #define ESB_HID_PAIR_PROTO_VERSION 2
 #define ESB_HID_PAIR_SLOT_NOT_YET 0xFF

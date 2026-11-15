@@ -153,8 +153,9 @@ static int esb_hid_rx_settings_set(const char *name, size_t len, settings_read_c
 SETTINGS_STATIC_HANDLER_DEFINE(esb_hid_rx, "esb_hid", NULL, esb_hid_rx_settings_set, NULL, NULL);
 #endif /* IS_ENABLED(CONFIG_SETTINGS) */
 
-/* Load the registry (or seed the step-2 defaults) once, from the
- * deferred link-start path, before any frame is attributed. */
+/* Load the registry once, from the deferred link-start path,
+ * before any frame is attributed. With no saved registry the
+ * receiver starts empty: slots are registered by pairing only. */
 static void registry_load_once(void) {
     if (registry_loaded) {
         return;
@@ -169,25 +170,42 @@ static void registry_load_once(void) {
 #endif
 
     if (!registry_from_settings) {
-        static const char *const default_names[ESB_HID_SLOT_COUNT] = {
-            "TentAlice",
-            "Nickey",
-            "koZakura",
-            "",
-        };
-
+        /* No saved registry: start empty. There used to be seeded
+         * default names here (step 2: TentAlice/Nickey/koZakura
+         * pre-registered with no device ID), but those name-keyed
+         * placeholder entries are what made duplicate clearing by
+         * name necessary — and name equality cannot tell two
+         * physical keyboards of the same model apart. The seeds and
+         * name-based clearing were removed together (2026-11-15);
+         * a fresh receiver pairs its first keyboard through the
+         * boot pairing window instead. */
         registry.active_slot = 0;
-        for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
-            registry.slots[i].used = (i < 3) ? 1 : 0;
-            memset(registry.slots[i].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
-            strncpy(registry.slots[i].name, default_names[i], ESB_HID_NAME_MAX);
-            registry.slots[i].name[ESB_HID_NAME_MAX] = '\0';
-        }
-        LOG_INF("ESB registry: no saved registry, seeded defaults");
+        LOG_INF("ESB registry: no saved registry, starting empty");
+    }
+
+    /* Names arriving from a stored blob are not trusted to be
+     * NUL-terminated; force it so the strcmp/strlen users stay in
+     * bounds even with a foreign or corrupted blob. */
+    for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+        registry.slots[i].name[ESB_HID_NAME_MAX] = '\0';
     }
 
     if (registry.active_slot >= ESB_HID_SLOT_COUNT) {
         registry.active_slot = 0;
+    }
+
+    /* Repair a dangling active slot persisted by an older firmware
+     * (deleting the active registration used to leave it pointing at
+     * the now-unused entry, which silently disabled forwarding and
+     * Studio for every other keyboard). */
+    if (!registry.slots[registry.active_slot].used) {
+        for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+            if (registry.slots[i].used) {
+                LOG_INF("ESB registry: active slot repaired %d -> %d", registry.active_slot, i);
+                registry.active_slot = (uint8_t)i;
+                break;
+            }
+        }
     }
 
     if (registry_migrated && registry_from_settings) {
@@ -219,11 +237,39 @@ struct esb_hid_peer {
 
 static struct esb_hid_peer peers[ESB_HID_SLOT_COUNT];
 
+/* Slot identity self-check (DESIGN.md SLOT_IDENTITY, 2026-11-15):
+ * the receiver periodically queues a SLOT_IDENTITY ACK payload on
+ * each active slot pipe, telling the keyboard there which device is
+ * registered at that slot, so a keyboard holding a stale profile can
+ * notice and drop it. identity_dirty forces an early re-send after a
+ * registry change for that slot. */
+#define ESB_HID_IDENTITY_PERIOD_MS 10000
+static int64_t identity_last_sent_ms[ESB_HID_SLOT_COUNT];
+static bool identity_dirty[ESB_HID_SLOT_COUNT];
+static uint8_t identity_seq;
+
 /* Duplicate suppression, per pipe and frame type. Indexed by pipe so
  * the pairing pipe (7) gets its own row; pipes 4..6 are never enabled
  * but keep a row for safety. */
 static uint8_t last_seq[8][ESB_HID_TYPE_COUNT];
 static bool seq_valid[8][ESB_HID_TYPE_COUNT];
+
+/* Forget everything the receiver holds about the device on a slot:
+ * cached status and HID bodies, and the per-pipe duplicate
+ * suppression for that pipe. Used when a slot's registration is
+ * deleted or replaced, so no state of the previous device (held
+ * keys in the cache, stale sequence numbers a successor could
+ * collide with) leaks into the next one. Also re-arms the BOOT edge
+ * and marks the slot identity for re-send. Callers hold
+ * esb_hid_rx_mutex. */
+static void peer_reset(uint8_t slot) {
+    memset(&peers[slot], 0, sizeof(peers[slot]));
+    peers[slot].boot_armed = true;
+    for (int i = 0; i < ESB_HID_TYPE_COUNT; i++) {
+        seq_valid[slot][i] = false;
+    }
+    identity_dirty[slot] = true;
+}
 
 bool esb_hid_get_device_status(uint8_t device_index, struct esb_hid_device_status *out) {
     if (device_index >= ESB_HID_SLOT_COUNT) {
@@ -253,6 +299,10 @@ uint8_t esb_hid_rx_studio_pipe(void) { return registry.active_slot; }
  * did not adopt (e.g. name mismatch): fall back to CANDIDATE. */
 #define ESB_HID_PAIRING_ASSIGN_GIVEUP_MS 10000
 #define ESB_HID_PAIRING_TIMER_PERIOD_MS 250
+/* How long DONE lingers before the timer drops back to IDLE. The
+ * Deck UI cancels DONE itself after ~1.5 s; this is for headless
+ * receivers, where nothing else stops the pairing timer. */
+#define ESB_HID_PAIRING_DONE_HOLD_MS 5000
 /* Boot window decision delay after link start: long enough for the
  * previously active keyboard's 5 s status heartbeat to land twice. */
 #define ESB_HID_BOOT_PAIRING_DELAY_MS 10000
@@ -334,6 +384,7 @@ static void pairing_load_payload(uint8_t slot, const char *name) {
 
 static void pairing_finalize(void) {
     registry.slots[pairing.target_slot].used = 1;
+    identity_dirty[pairing.target_slot] = true;
     strncpy(registry.slots[pairing.target_slot].name, pairing.candidate_name, ESB_HID_NAME_MAX);
     registry.slots[pairing.target_slot].name[ESB_HID_NAME_MAX] = '\0';
     memset(registry.slots[pairing.target_slot].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
@@ -342,41 +393,62 @@ static void pairing_finalize(void) {
                pairing.candidate_id_len);
     }
 
+    /* The slot's device may have changed: drop the previous device's
+     * peer state, so its cached held keys and status are never
+     * re-injected or displayed as the new device's. */
+    peer_reset(pairing.target_slot);
+
     /* Clear any duplicate registration of the same device in other
-     * slots: same hardware ID when both sides have one, otherwise
-     * same name. */
-    for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
-        if (i == pairing.target_slot || !registry.slots[i].used) {
-            continue;
-        }
-        bool stored_id_nonzero = false;
-
-        for (int j = 0; j < ESB_HID_DEVICE_ID_LEN; j++) {
-            if (registry.slots[i].dev_id[j] != 0) {
-                stored_id_nonzero = true;
-                break;
+     * slots. Duplicates are recognised by hardware ID only: the
+     * candidate must carry a full ID and it must match exactly.
+     * Name equality is NOT used — two different keyboards can share
+     * a model name, and silently clearing a stranger's registration
+     * is worse than leaving a duplicate the user can see in the
+     * list and delete by hand (policy decided 2026-11-15; this is
+     * also what retired the seeded default names). */
+    if (pairing.candidate_id_len == ESB_HID_DEVICE_ID_LEN) {
+        for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+            if (i == pairing.target_slot || !registry.slots[i].used) {
+                continue;
             }
-        }
-        bool id_match_possible = pairing.candidate_id_len > 0 && stored_id_nonzero;
-        bool duplicate = id_match_possible
-                             ? (memcmp(registry.slots[i].dev_id, pairing.candidate_id,
-                                       ESB_HID_DEVICE_ID_LEN) == 0)
-                             : (strcmp(registry.slots[i].name, pairing.candidate_name) == 0);
-
-        if (duplicate) {
-            LOG_INF("Registry: \"%s\" moved slot %d -> %d (duplicate cleared)",
-                    pairing.candidate_name, i, pairing.target_slot);
-            registry.slots[i].used = 0;
-            registry.slots[i].name[0] = '\0';
-            memset(registry.slots[i].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
-            if (registry.active_slot == i && registry.active_slot != pairing.target_slot) {
-                registry.active_slot = pairing.target_slot;
+            if (memcmp(registry.slots[i].dev_id, pairing.candidate_id,
+                       ESB_HID_DEVICE_ID_LEN) == 0) {
+                LOG_INF("Registry: \"%s\" moved slot %d -> %d (duplicate cleared)",
+                        pairing.candidate_name, i, pairing.target_slot);
+                registry.slots[i].used = 0;
+                registry.slots[i].name[0] = '\0';
+                memset(registry.slots[i].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
+                peer_reset(i);
+                if (registry.active_slot == i && registry.active_slot != pairing.target_slot) {
+                    registry.active_slot = pairing.target_slot;
+                }
             }
         }
     }
 
+    /* A dangling active slot (left behind by deleting the active
+     * registration before this fix, or by an emptied registry) heals
+     * here: the fresh registration becomes active. */
+    if (!registry.slots[registry.active_slot].used) {
+        registry.active_slot = pairing.target_slot;
+    }
+
     registry_save();
+
+    if (pairing.target_slot == registry.active_slot) {
+        /* The device behind the Studio pipe was just (re)registered:
+         * the session state belongs to its previous incarnation, so
+         * drop it like a slot switch does. */
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
+        esb_hid_studio_fwd_flush_session();
+#endif
+    }
+
     pairing.state = ESB_HID_PAIRING_DONE;
+    /* DONE is a display state; give it a short deadline so the
+     * pairing timer expires it back to IDLE instead of rescheduling
+     * forever on receivers nobody cancels it on (headless builds). */
+    pairing.deadline_ms = k_uptime_get() + ESB_HID_PAIRING_DONE_HOLD_MS;
     LOG_INF("Pairing: slot %d registered to \"%s\"", pairing.target_slot, pairing.candidate_name);
 }
 
@@ -417,8 +489,12 @@ static void pairing_timer_handler(struct k_work *work) {
                 pairing.candidate_name, pairing.target_slot);
         pairing.state = ESB_HID_PAIRING_CANDIDATE;
         pairing_load_payload(ESB_HID_PAIR_SLOT_NOT_YET, NULL);
-    } else if (pairing.state != ESB_HID_PAIRING_DONE && now >= pairing.deadline_ms) {
-        LOG_INF("Pairing: window timed out, back to idle");
+    } else if (now >= pairing.deadline_ms) {
+        if (pairing.state == ESB_HID_PAIRING_DONE) {
+            LOG_INF("Pairing: done, back to idle");
+        } else {
+            LOG_INF("Pairing: window timed out, back to idle");
+        }
         pairing.state = ESB_HID_PAIRING_IDLE;
         pairing.candidate_name[0] = '\0';
         memset(pairing.candidate_id, 0, ESB_HID_DEVICE_ID_LEN);
@@ -476,6 +552,31 @@ static void pairing_on_request(const uint8_t *body, size_t len) {
     }
     if (name_len > ESB_HID_NAME_MAX) {
         name_len = ESB_HID_NAME_MAX;
+    }
+
+    /* Once a candidate exists, only that keyboard's own requests
+     * count. A request from a different keyboard must neither
+     * replace the candidate the user is looking at (they would
+     * confirm one keyboard and register another) nor refresh
+     * last_request_ms (the ASSIGNING silence check would never
+     * elapse while a second keyboard nearby keeps asking). The
+     * match is by hardware ID when the candidate carries one,
+     * otherwise by name — an ID-less (proto v1) keyboard has no
+     * stronger identity to check against. */
+    if (pairing.state == ESB_HID_PAIRING_CANDIDATE ||
+        pairing.state == ESB_HID_PAIRING_ASSIGNING) {
+        bool matches;
+
+        if (pairing.candidate_id_len > 0) {
+            matches = candidate_id_len == pairing.candidate_id_len &&
+                      memcmp(candidate_id, pairing.candidate_id, candidate_id_len) == 0;
+        } else {
+            matches = name_len == strlen(pairing.candidate_name) &&
+                      memcmp(&body[name_offset], pairing.candidate_name, name_len) == 0;
+        }
+        if (!matches) {
+            return;
+        }
     }
 
     pairing.last_request_ms = k_uptime_get();
@@ -596,25 +697,42 @@ static void boot_pairing_maybe_open(void) {
     }
     attempted = true;
 
-    if (registry.active_slot < ESB_HID_SLOT_COUNT &&
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    /* Suppression means "the keyboard this receiver is used with is
+     * already on the air" — that only holds while the active slot
+     * is still registered. Peer state is updated for every pipe,
+     * registered or not, so after the active registration was
+     * deleted, the deleted keyboard's ongoing frames would
+     * otherwise suppress the window forever (and a headless
+     * receiver would have no way back in). */
+    if (registry.active_slot < ESB_HID_SLOT_COUNT && registry.slots[registry.active_slot].used &&
         peers[registry.active_slot].last_seen_ms != 0) {
         LOG_INF("Pairing: active keyboard already on air, no boot window");
+        k_mutex_unlock(&esb_hid_rx_mutex);
         return;
     }
 
+    int free_slot = -1;
+
     for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
         if (!registry.slots[i].used) {
-            boot_pairing_armed = true;
-            if (esb_hid_pairing_open(i) == 0) {
-                LOG_INF("Pairing: boot window opened for free slot %d (%s)", i,
-                        IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING_AUTO)
-                            ? "auto-assign"
-                            : "waiting for on-device confirm");
-            } else {
-                boot_pairing_armed = false;
-            }
-            return;
+            free_slot = i;
+            break;
         }
+    }
+    k_mutex_unlock(&esb_hid_rx_mutex);
+
+    if (free_slot >= 0) {
+        boot_pairing_armed = true;
+        if (esb_hid_pairing_open(free_slot) == 0) {
+            LOG_INF("Pairing: boot window opened for free slot %d (%s)", free_slot,
+                    IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING_AUTO)
+                        ? "auto-assign"
+                        : "waiting for on-device confirm");
+        } else {
+            boot_pairing_armed = false;
+        }
+        return;
     }
     LOG_INF("Pairing: all slots registered, no boot window (headless)");
 }
@@ -749,10 +867,50 @@ int esb_hid_rx_delete_slot(uint8_t slot) {
     }
 
     k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    bool was_active = (slot == registry.active_slot);
+
+    if (was_active) {
+        /* Release everything this device may still hold on the host
+         * (same contract as set_active_slot): it will not get a
+         * chance to send the releases itself once unregistered. */
+        for (int type = 0; type < 3; type++) {
+            if (peers[slot].hid_cache[type].valid) {
+                uint8_t zeroed[ESB_HID_CACHE_BODY_MAX] = {0};
+
+                zmk_usb_hid_send_report_with_id(report_ids[type], zeroed,
+                                                peers[slot].hid_cache[type].len);
+            }
+        }
+    }
     registry.slots[slot].used = 0;
     registry.slots[slot].name[0] = '\0';
     memset(registry.slots[slot].dev_id, 0, ESB_HID_DEVICE_ID_LEN);
+    peer_reset(slot);
+    if (was_active) {
+        /* The active slot must not dangle at an unused entry: the
+         * forwarding gate and the Studio pipe both follow it, so a
+         * dangling active silently kills input and Studio for every
+         * remaining keyboard. Hand active to the first remaining
+         * registered slot; if none is left, pairing_finalize adopts
+         * the next registration as active. */
+        for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+            if (registry.slots[i].used) {
+                registry.active_slot = (uint8_t)i;
+                break;
+            }
+        }
+    }
     registry_save();
+    if (was_active) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO_RX)
+        /* The Studio session belonged to the deleted device: flush
+         * it (this also purges the queued ACK payloads on all
+         * pipes), so no downlink fragment addressed to it can reach
+         * the successor on the Studio pipe — the same contract
+         * set_active_slot keeps when switching away from a device. */
+        esb_hid_studio_fwd_flush_session();
+#endif
+    }
     LOG_INF("ESB registry: slot %d deleted", slot);
     k_mutex_unlock(&esb_hid_rx_mutex);
     return 0;
@@ -953,6 +1111,38 @@ static void esb_hid_rx_event_handler(const struct esb_evt *evt) {
     }
 }
 
+/* Queue one SLOT_IDENTITY ACK payload on a slot pipe. Callers hold
+ * esb_hid_rx_mutex (handle_payload context). A failed write (ACK
+ * FIFO full) leaves the bookkeeping untouched so the next received
+ * frame retries; Studio fragments keep priority by volume alone —
+ * identity payloads are one small frame per pipe per period. */
+static void identity_load_payload(uint8_t slot) {
+    struct esb_payload payload = {
+        .length = ESB_HID_FRAME_HDR_LEN + 1 + ESB_HID_DEVICE_ID_LEN,
+        .pipe = slot,
+        .noack = 0,
+    };
+    payload.data[0] = ESB_HID_TYPE_SLOT_IDENTITY;
+    payload.data[1] = identity_seq++;
+    payload.data[ESB_HID_FRAME_HDR_LEN] = registry.slots[slot].used
+                                              ? ESB_HID_SLOT_IDENTITY_REGISTERED
+                                              : 0;
+    memcpy(&payload.data[ESB_HID_FRAME_HDR_LEN + 1], registry.slots[slot].dev_id,
+           ESB_HID_DEVICE_ID_LEN);
+
+    if (esb_write_payload(&payload) == 0) {
+        identity_last_sent_ms[slot] = k_uptime_get();
+        identity_dirty[slot] = false;
+    }
+}
+
+static void identity_maybe_load(uint8_t slot) {
+    if (identity_dirty[slot] || identity_last_sent_ms[slot] == 0 ||
+        k_uptime_get() - identity_last_sent_ms[slot] >= ESB_HID_IDENTITY_PERIOD_MS) {
+        identity_load_payload(slot);
+    }
+}
+
 static void handle_payload(const struct esb_payload *payload) {
     if (payload->length < ESB_HID_FRAME_HDR_LEN) {
         return;
@@ -1057,6 +1247,8 @@ static void handle_payload(const struct esb_payload *payload) {
          * ignore. */
         break;
     }
+
+    identity_maybe_load(slot);
 
     k_mutex_unlock(&esb_hid_rx_mutex);
 }

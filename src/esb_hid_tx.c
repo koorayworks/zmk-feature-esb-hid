@@ -201,6 +201,16 @@ static struct esb_hid_receiver_profile profiles[ESB_HID_MAX_RECEIVERS];
 static uint8_t profile_count = 1;
 static uint8_t active_profile;
 
+/* Slot identity self-check (DESIGN.md SLOT_IDENTITY, 2026-11-15).
+ * unpaired_wait parks all slot-pipe traffic after the only profile
+ * was dropped as stale: the keyboard stays quiet until a fresh
+ * pairing assignment arrives, instead of haunting a receiver that no
+ * longer has it registered. RAM-only on purpose: after a reboot the
+ * factory-default profile is tried once and re-invalidated by the
+ * receiver's identity frames if it is still unregistered. */
+static bool unpaired_wait;
+static uint8_t identity_mismatch_streak;
+
 /* On-disk profile list ("esb_hid/receivers"). Explicit layout, not
  * the RAM struct. */
 struct esb_hid_receivers_disk {
@@ -362,6 +372,8 @@ static void profiles_upsert(const uint8_t *rx_id, uint8_t slot) {
 #endif
     active_profile = 0;
     own_slot = slot;
+    unpaired_wait = false;
+    identity_mismatch_streak = 0;
     profiles_save();
 }
 
@@ -454,6 +466,9 @@ static void pairing_handle_assign(const uint8_t *body, size_t len);
  * hunt in progress. */
 static void hunt_cancel(void);
 
+/* Slot identity handler (defined in the link monitor section). */
+static void identity_handle(const uint8_t *body, size_t len);
+
 #if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
 /* Studio helpers (defined in the Studio section below). */
 static void studio_note_activity(void);
@@ -489,6 +504,9 @@ static void drain_ack_payloads(void) {
             if (pairing_active) {
                 pairing_handle_assign(body, body_len);
             }
+            break;
+        case ESB_HID_TYPE_SLOT_IDENTITY:
+            identity_handle(body, body_len);
             break;
         default:
             LOG_DBG("Ignoring unexpected ACK payload type %d (len %d)", payload.data[0],
@@ -1047,6 +1065,77 @@ static void link_monitor(uint8_t type, bool ok) {
 /* Drive the hunt from the TX thread: send the status snapshot as
  * the probe for the current candidate and pace the passes. The
  * probe's result comes back through link_monitor(). */
+/* ------------------------------------------------------------------ */
+/* Slot identity self-check (DESIGN.md SLOT_IDENTITY, 2026-11-15)     */
+
+/* Drop the active profile after the receiver told us (twice in a
+ * row) that this keyboard is not what it has registered on our pipe:
+ * the registry entry was deleted, or the slot now belongs to another
+ * keyboard. With further profiles left, hunting resumes over them;
+ * with none, the profile resets to the factory unknown state and
+ * unpaired_wait parks all slot-pipe traffic until a fresh pairing. */
+static void identity_drop_active_profile(void) {
+    LOG_WRN("Slot identity: receiver registration mismatch; dropping profile %d (slot %d)",
+            active_profile, own_slot);
+
+    if (profile_count > 1) {
+        memmove(&profiles[active_profile], &profiles[active_profile + 1],
+                (profile_count - active_profile - 1) * sizeof(profiles[0]));
+        profile_count--;
+        active_profile = 0;
+        own_slot = profiles[0].slot;
+        tx_pipe = own_slot;
+    } else {
+        memset(profiles[0].rx_id, 0, ESB_HID_DEVICE_ID_LEN);
+        profiles[0].slot = CONFIG_ZMK_ESB_HID_SLOT;
+        own_slot = profiles[0].slot;
+        tx_pipe = own_slot;
+        unpaired_wait = true;
+    }
+    profiles_save();
+    link_up = false;
+    status_fail_streak = 0;
+    hunt_start(true);
+}
+
+static void identity_handle(const uint8_t *body, size_t len) {
+    if (len < 1 + ESB_HID_DEVICE_ID_LEN || pairing_active || hunting || unpaired_wait) {
+        return;
+    }
+
+    bool mismatch;
+
+    if (!(body[0] & ESB_HID_SLOT_IDENTITY_REGISTERED)) {
+        mismatch = true;
+    } else {
+        const uint8_t *reg_id = &body[1];
+        bool reg_zero = true;
+
+        for (int i = 0; i < ESB_HID_DEVICE_ID_LEN; i++) {
+            if (reg_id[i] != 0) {
+                reg_zero = false;
+                break;
+            }
+        }
+        if (reg_zero || fetch_device_id() != ESB_HID_DEVICE_ID_LEN) {
+            /* Legacy registration without an ID, or our own ID is
+             * unreadable: either way we cannot judge. */
+            identity_mismatch_streak = 0;
+            return;
+        }
+        mismatch = memcmp(reg_id, device_id, ESB_HID_DEVICE_ID_LEN) != 0;
+    }
+
+    if (!mismatch) {
+        identity_mismatch_streak = 0;
+        return;
+    }
+    if (++identity_mismatch_streak >= 2) {
+        identity_mismatch_streak = 0;
+        identity_drop_active_profile();
+    }
+}
+
 static void hunt_tick(void) {
     if (!hunting || pairing_active) {
         return;
@@ -1137,7 +1226,7 @@ static void tx_thread(void) {
              * pipe. Everything else is dropped (state reports are
              * re-sent after pairing via the resync mechanism / the
              * next change event anyway). */
-            if (!pairing_active || frame.type == ESB_HID_TYPE_PAIR_REQUEST) {
+            if ((!pairing_active && !unpaired_wait) || frame.type == ESB_HID_TYPE_PAIR_REQUEST) {
                 bool sent_ok = send_frame(&frame);
 
                 link_monitor(frame.type, sent_ok);
