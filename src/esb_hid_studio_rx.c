@@ -35,6 +35,18 @@
  *   stream. The CDC out thread therefore drops bytes after boot and
  *   after every flush until the first SOF (0xAB) of a framed message
  *   has been forwarded.
+ *
+ *   Session generations: every flush, and every session start (CDC
+ *   DTR rise), bumps a generation counter. Uplink chunks are stamped
+ *   with the generation at queue time and the CDC out thread drops
+ *   stamps from older generations, which closes the purge races (a
+ *   chunk being written when the flush runs, a fragment landing in
+ *   the queue right after the purge). The out thread also never
+ *   writes while no client is connected, and the CDC in thread never
+ *   queues downlink bytes while no client is connected: bytes parked
+ *   in the CDC TX buffer are delivered at the head of the next
+ *   session, and one stale response there (an old getDeviceInfo
+ *   reply) is enough to abort it with a request-ID mismatch.
  */
 
 #include <zephyr/device.h>
@@ -66,6 +78,8 @@ static uint8_t down_seq;
 /* Keyboard -> PC fragments waiting for CDC TX. */
 struct esb_studio_up_chunk {
     uint8_t len;
+    /* Session generation at queue time (see studio_session_gen). */
+    uint32_t gen;
     uint8_t data[ESB_HID_STUDIO_FRAG_MAX];
 };
 
@@ -86,6 +100,20 @@ K_MSGQ_DEFINE(esb_studio_up_queue, sizeof(struct esb_studio_up_chunk), 16, 4);
  * unaffected: its stream starts with SOF by definition. */
 static volatile bool studio_await_sof = true;
 
+/* Session generation: bumped by every session flush and by every
+ * session start, so chunks queued for a previous session can be told
+ * apart from the current one's even when they reach the up-queue (or
+ * are being written) after the flush's purge has already run. */
+static volatile uint32_t studio_session_gen;
+
+/* Session hygiene counters, reported (and reset) when the next
+ * client connects, so the drops above stay observable on hardware:
+ * uplink chunks dropped for a stale generation, and bytes dropped
+ * because no client was connected to receive them. */
+static volatile uint32_t up_stale_chunk_drops;
+static volatile uint32_t up_unattended_byte_drops;
+static volatile uint32_t down_unattended_byte_drops;
+
 void esb_hid_studio_fwd_to_pc(const uint8_t *data, size_t len) {
     struct esb_studio_up_chunk chunk;
 
@@ -93,6 +121,7 @@ void esb_hid_studio_fwd_to_pc(const uint8_t *data, size_t len) {
         len = sizeof(chunk.data);
     }
     chunk.len = (uint8_t)len;
+    chunk.gen = studio_session_gen;
     memcpy(chunk.data, data, len);
 
     if (k_msgq_put(&esb_studio_up_queue, &chunk, K_NO_WAIT) != 0) {
@@ -165,6 +194,10 @@ static void esb_studio_do_flush(void) {
     ring_buf_reset(&esb_studio_down_buf);
     k_msgq_purge(&esb_studio_up_queue);
     studio_await_sof = true;
+    /* Everything queued or in flight from before this point belongs
+     * to the dead session; the generation bump lets the CDC out
+     * thread drop it even if it surfaces after the purge. */
+    studio_session_gen++;
     hint_replenish_armed = true;
 
     int err = esb_stop_rx();
@@ -190,13 +223,42 @@ static void esb_studio_do_flush(void) {
     LOG_INF("Studio session flushed");
 }
 
-/* Flush when the CDC client goes away: a readable DTR that drops
- * from connected to not-connected. The unreadable case (fallback:
+/* Uplink-only flush for a session start (DTR rise): purge whatever
+ * the previous session left in the up-queue, re-arm the resync and
+ * bump the generation, but leave the downlink ring and the radio
+ * alone — the new client may already be sending, and its bytes are
+ * the new session's own. Loader thread only. */
+static void esb_studio_do_uplink_flush(void) {
+    k_msgq_purge(&esb_studio_up_queue);
+    studio_await_sof = true;
+    studio_session_gen++;
+
+    LOG_INF("Studio uplink flushed (new session)");
+}
+
+/* Report the session hygiene counters accumulated since the last
+ * session start, then reset them. Loader thread only. */
+static void esb_studio_report_hygiene(void) {
+    if (up_stale_chunk_drops == 0 && up_unattended_byte_drops == 0 &&
+        down_unattended_byte_drops == 0) {
+        return;
+    }
+    LOG_INF("Studio session hygiene: dropped %u stale uplink chunk(s), %u uplink byte(s) "
+            "and %u downlink byte(s) while no client was connected",
+            up_stale_chunk_drops, up_unattended_byte_drops, down_unattended_byte_drops);
+    up_stale_chunk_drops = 0;
+    up_unattended_byte_drops = 0;
+    down_unattended_byte_drops = 0;
+}
+
+/* Watch the CDC client's DTR edges: flush when a readable DTR drops
+ * from connected to not-connected, and start each new session from a
+ * clean uplink state when it rises. The unreadable case (fallback:
  * assume connected) never flushes, it has no edge to detect. */
 static bool dtr_sample_valid;
 static bool dtr_was_connected;
 
-static void esb_studio_check_dtr_drop(void) {
+static void esb_studio_check_dtr_edges(void) {
     bool connected;
 
     if (!esb_studio_cdc_dtr(&connected)) {
@@ -205,6 +267,10 @@ static void esb_studio_check_dtr_drop(void) {
     if (dtr_sample_valid && dtr_was_connected && !connected) {
         LOG_INF("Studio client disconnected (DTR drop)");
         esb_studio_do_flush();
+    } else if (dtr_sample_valid && !dtr_was_connected && connected) {
+        LOG_INF("Studio client connected (DTR rise)");
+        esb_studio_report_hygiene();
+        esb_studio_do_uplink_flush();
     }
     dtr_sample_valid = true;
     dtr_was_connected = connected;
@@ -247,11 +313,16 @@ static void esb_studio_ack_loader_thread(void) {
     while (1) {
         k_sem_take(&esb_studio_down_sem, K_MSEC(100));
 
+        /* Generation at the start of this pass: if a flush runs
+         * below (posted, or a DTR edge), bytes claimed in this pass
+         * straddle the flush boundary and must not be loaded. */
+        uint32_t pass_gen = studio_session_gen;
+
         if (flush_requested) {
             flush_requested = false;
             esb_studio_do_flush();
         }
-        esb_studio_check_dtr_drop();
+        esb_studio_check_dtr_edges();
 
         bool fifo_full = false;
 
@@ -260,6 +331,16 @@ static void esb_studio_ack_loader_thread(void) {
                                                     ESB_HID_STUDIO_FRAG_MAX);
 
             if (claim_len == 0) {
+                break;
+            }
+
+            if (studio_session_gen != pass_gen) {
+                /* A flush ran in this pass and reset the ring, so
+                 * this claim is void; leave the bytes for the next
+                 * pass rather than load pre-flush bytes into the
+                 * ACK FIFO. */
+                ring_buf_get_finish(&esb_studio_down_buf, 0);
+                LOG_WRN("Studio downlink load deferred across a session flush");
                 break;
             }
 
@@ -309,6 +390,15 @@ static void esb_studio_cdc_in_thread(void) {
             continue;
         }
 
+        if (!esb_studio_cdc_connected()) {
+            /* No client session: this byte is the tail of a dead
+             * session draining out of the CDC RX buffer late. It
+             * must not enter the downlink ring, where it would head
+             * the next session's request stream. */
+            down_unattended_byte_drops++;
+            continue;
+        }
+
         if (ring_buf_put(&esb_studio_down_buf, &byte, 1) < 1) {
             LOG_WRN("Studio down-buffer full, dropping CDC byte");
             continue;
@@ -325,7 +415,35 @@ static void esb_studio_cdc_out_thread(void) {
 
     while (1) {
         k_msgq_get(&esb_studio_up_queue, &chunk, K_FOREVER);
+
+        if (chunk.gen != studio_session_gen) {
+            /* Queued for a session that has since been flushed (the
+             * fragment was in flight over ESB while the purge ran,
+             * or the queue was purged around it): it belongs to a
+             * dead session and must never head a new one. */
+            up_stale_chunk_drops++;
+            continue;
+        }
+
+        if (!esb_studio_cdc_connected()) {
+            /* No client: bytes written now would wait in the CDC TX
+             * buffer and be delivered at the head of the NEXT
+             * session, poisoning it — one stale getDeviceInfo
+             * response is enough for an instant request-ID mismatch.
+             * Drop them instead; a client re-issues its requests
+             * when it connects. */
+            up_unattended_byte_drops += chunk.len;
+            continue;
+        }
+
         for (int i = 0; i < chunk.len; i++) {
+            if (chunk.gen != studio_session_gen) {
+                /* A flush ran while this chunk was being written:
+                 * stop rather than finish a dead session's message
+                 * into the next one. */
+                up_stale_chunk_drops++;
+                break;
+            }
             if (studio_await_sof) {
                 if (chunk.data[i] != ESB_HID_STUDIO_SOF_BYTE) {
                     /* Stale byte from a dead session: drop it. */
