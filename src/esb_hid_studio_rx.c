@@ -221,10 +221,30 @@ static bool esb_studio_cdc_connected(void) {
  * practice — latches a pass/drop decision the moment the ID is
  * known, and streams or swallows the remainder until EOF.
  *
- * The outstanding table is keyed to the session generation: the
- * first register/consume after a generation bump starts from an
- * empty table, which is what clears it on every session flush, with
- * no extra work in the flush paths themselves. */
+ * The outstanding table's lifetime belongs to the CDC in thread:
+ * it reads DTR for every byte anyway, and on the
+ * disconnected-to-connected transition it observes, it clears the
+ * table (and resets the downlink observer) before the session's
+ * first byte is observed. Registration happens only in that same
+ * thread, so a clear is always ordered against registrations of
+ * the session it ends — never against one it begins. The earlier
+ * design keyed the table to the session generation and cleared it
+ * lazily at the next register/consume after a bump; that raced,
+ * because the in thread can register a new session's first request
+ * before the loader thread has run the session-start bump, and the
+ * response's consume then wiped the registration it was looking
+ * for and dropped the response, hanging the session on its first
+ * exchange. The loader's flushes therefore deliberately do not
+ * touch the table: a posted flush can execute after a new session
+ * has already started registering, and a keyboard reboot does not
+ * end the CDC session — registrations stay valid for the client's
+ * retries, while the dead boot's own responses are kept out by
+ * the generation-stamped uplink chunk gates. When DTR cannot be
+ * read, the fallback treats the port as always connected, no
+ * transition is ever observed and the table is never cleared —
+ * the same no-flush behaviour as the loader's edge detection;
+ * leftover entries are bounded by the table size and evicted
+ * oldest-first. */
 
 #define ESB_HID_STUDIO_GATE_MAX_IDS 16
 #define ESB_HID_STUDIO_GATE_HDR_MAX 32
@@ -247,20 +267,21 @@ static volatile uint32_t up_gate_byte_drops;
 static struct k_spinlock gate_table_lock;
 static uint32_t gate_table_ids[ESB_HID_STUDIO_GATE_MAX_IDS];
 static uint8_t gate_table_count;
-static uint32_t gate_table_gen;
 
-/* Caller holds gate_table_lock. */
-static void gate_table_sync_gen(void) {
-    if (gate_table_gen != studio_session_gen) {
-        gate_table_gen = studio_session_gen;
-        gate_table_count = 0;
-    }
+/* Empty the outstanding table. Called only from the CDC in thread,
+ * at the session transition it observes itself (see the gate note
+ * above); consumes in the CDC out thread only ever remove entries,
+ * so no clear can land between a registration and its response. */
+static void gate_table_clear(void) {
+    k_spinlock_key_t key = k_spin_lock(&gate_table_lock);
+
+    gate_table_count = 0;
+    k_spin_unlock(&gate_table_lock, key);
 }
 
 static void gate_register_id(uint32_t id) {
     k_spinlock_key_t key = k_spin_lock(&gate_table_lock);
 
-    gate_table_sync_gen();
     for (int i = 0; i < gate_table_count; i++) {
         if (gate_table_ids[i] == id) {
             k_spin_unlock(&gate_table_lock, key);
@@ -288,7 +309,6 @@ static bool gate_consume_id(uint32_t id) {
     k_spinlock_key_t key = k_spin_lock(&gate_table_lock);
     bool found = false;
 
-    gate_table_sync_gen();
     for (int i = 0; i < gate_table_count; i++) {
         if (gate_table_ids[i] == id) {
             memmove(&gate_table_ids[i], &gate_table_ids[i + 1],
@@ -776,6 +796,13 @@ K_THREAD_DEFINE(esb_hid_studio_ack_loader_thread, 1024, esb_studio_ack_loader_th
                 NULL, K_PRIO_PREEMPT(8), 0, 0);
 
 static void esb_studio_cdc_in_thread(void) {
+    /* This thread's own view of the client connection. The
+     * request-ID gate table is cleared on the rising transition
+     * observed here — in the only thread that registers into it —
+     * so the clear is ordered before the new session's first
+     * registration by construction (see the gate note above). */
+    bool session_open = false;
+
     while (1) {
         uint8_t byte;
 
@@ -784,14 +811,31 @@ static void esb_studio_cdc_in_thread(void) {
             continue;
         }
 
-        if (!esb_studio_cdc_connected()) {
+        bool connected;
+        bool dtr_readable = esb_studio_cdc_dtr(&connected);
+
+        if (dtr_readable && !connected) {
             /* No client session: this byte is the tail of a dead
              * session draining out of the CDC RX buffer late. It
              * must not enter the downlink ring, where it would head
              * the next session's request stream. */
             down_unattended_byte_drops++;
+            session_open = false;
             gate_down_reset();
             continue;
+        }
+
+        if (dtr_readable && !session_open) {
+            /* First byte of a new session as this thread sees it:
+             * start the gate table and the downlink observer from
+             * empty, before this byte is observed. When DTR cannot
+             * be read, the fallback treats the port as always
+             * connected and this never runs — no transition is
+             * observable, exactly as for the loader's edge
+             * detection. */
+            gate_table_clear();
+            gate_down_reset();
+            session_open = true;
         }
 
         if (ring_buf_put(&esb_studio_down_buf, &byte, 1) < 1) {
