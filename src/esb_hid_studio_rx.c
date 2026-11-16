@@ -47,12 +47,25 @@
  *   in the CDC TX buffer are delivered at the head of the next
  *   session, and one stale response there (an old getDeviceInfo
  *   reply) is enough to abort it with a request-ID mismatch.
+ *
+ *   Request-ID gate: those gates still cannot stop a complete
+ *   response that the keyboard generated for a previous session's
+ *   request but that is only delivered after the next session has
+ *   started — it is a well-formed frame and passes the resync. So
+ *   the out thread additionally parses the head of every uplink
+ *   message and forwards a RequestResponse only when its echoed
+ *   request_id is currently outstanding for this session (registered
+ *   by a passive observer on the downlink), consuming the entry as
+ *   it passes; anything else is swallowed whole. Notifications
+ *   carry no request ID and pass whenever the stream itself does.
+ *   See the gate section below for the exact rules.
  */
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/spinlock.h>
 #include <zephyr/sys/ring_buffer.h>
 
 #include <string.h>
@@ -169,6 +182,383 @@ static bool esb_studio_cdc_connected(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Request-ID gate                                                     */
+
+/* A passive observer on the downlink (CDC in thread) registers the
+ * request_id at the head of every framed Request the client sends;
+ * the CDC out thread parses the head of every uplink message on the
+ * fly and forwards a RequestResponse only when its echoed
+ * request_id is in that outstanding set, consuming the entry as it
+ * passes. A response produced for a previous session's request —
+ * still in flight when the next session starts, a complete and
+ * well-formed frame that no framing-level filter can tell apart —
+ * names an ID the new session never registered (or has already had
+ * answered), so it is swallowed whole, as is a second copy of a
+ * legitimate response. Notifications (Response field 2) carry no
+ * request_id and are forwarded whenever the stream itself is.
+ *
+ * Wire format, verified against the sources rather than assumed:
+ * framing is SOF 0xAB / ESC 0xAC / EOF 0xAD with ESC + byte for a
+ * data byte equal to a framing byte (zmk msg_framing, mirrored by
+ * the Corne bare-metal studio_framing). Inside the frame sits a
+ * protobuf zmk.studio.Response: field 1 (tag 0x0A) wraps a
+ * RequestResponse whose first field is request_id (tag 0x08,
+ * varint); field 2 (tag 0x12) wraps a Notification. A downlink
+ * zmk.studio.Request likewise carries request_id as field 1, ahead
+ * of the subsystem oneof (fields 3/4/5). Every encoder in this
+ * ecosystem emits it first — the proto declares it field 1, nanopb
+ * (ZMK keyboards) encodes in field order, and the Corne hand-rolled
+ * writer emits it before the subsystem (resp_begin in its
+ * studio.c) — and a proto3 sender that omits a zero request_id
+ * instead shows its subsystem tag first, which the parsers below
+ * treat as ID 0. A head that parses neither way is dropped as
+ * unparseable rather than passed on faith.
+ *
+ * Neither parser ever buffers a whole message (the receiver's RAM
+ * is nearly full): the uplink gate holds only the raw bytes of the
+ * current message head — SOF, the Response tag, the submessage
+ * length varint, the request_id tag and varint, a few bytes in
+ * practice — latches a pass/drop decision the moment the ID is
+ * known, and streams or swallows the remainder until EOF.
+ *
+ * The outstanding table is keyed to the session generation: the
+ * first register/consume after a generation bump starts from an
+ * empty table, which is what clears it on every session flush, with
+ * no extra work in the flush paths themselves. */
+
+#define ESB_HID_STUDIO_GATE_MAX_IDS 16
+#define ESB_HID_STUDIO_GATE_HDR_MAX 32
+
+/* Studio framing bytes (see the framing note above). SOF already
+ * has ESB_HID_STUDIO_SOF_BYTE. */
+#define ESB_HID_STUDIO_ESC_BYTE 0xAC
+#define ESB_HID_STUDIO_EOF_BYTE 0xAD
+
+/* Protobuf tags at the message heads parsed below. */
+#define GATE_TAG_REQUEST_ID 0x08     /* field 1, varint (both directions) */
+#define GATE_TAG_RESPONSE_RR 0x0A    /* Response field 1: RequestResponse */
+#define GATE_TAG_RESPONSE_NOTIF 0x12 /* Response field 2: Notification */
+
+/* Gate hygiene counters, reported (and reset) with the rest of the
+ * session hygiene counters at the next session start. */
+static volatile uint32_t up_gate_msg_drops;
+static volatile uint32_t up_gate_byte_drops;
+
+static struct k_spinlock gate_table_lock;
+static uint32_t gate_table_ids[ESB_HID_STUDIO_GATE_MAX_IDS];
+static uint8_t gate_table_count;
+static uint32_t gate_table_gen;
+
+/* Caller holds gate_table_lock. */
+static void gate_table_sync_gen(void) {
+    if (gate_table_gen != studio_session_gen) {
+        gate_table_gen = studio_session_gen;
+        gate_table_count = 0;
+    }
+}
+
+static void gate_register_id(uint32_t id) {
+    k_spinlock_key_t key = k_spin_lock(&gate_table_lock);
+
+    gate_table_sync_gen();
+    for (int i = 0; i < gate_table_count; i++) {
+        if (gate_table_ids[i] == id) {
+            k_spin_unlock(&gate_table_lock, key);
+            return;
+        }
+    }
+    if (gate_table_count == ESB_HID_STUDIO_GATE_MAX_IDS) {
+        /* More requests in flight than the table holds: evict the
+         * oldest registration. If its response ever arrives it is
+         * dropped as unknown and the client recovers by retrying,
+         * while the requests it is actively waiting for stay gated
+         * correctly. */
+        LOG_WRN("Studio request-id table full, evicting oldest id %u", gate_table_ids[0]);
+        memmove(&gate_table_ids[0], &gate_table_ids[1],
+                (ESB_HID_STUDIO_GATE_MAX_IDS - 1) * sizeof(gate_table_ids[0]));
+        gate_table_count--;
+    }
+    gate_table_ids[gate_table_count++] = id;
+    k_spin_unlock(&gate_table_lock, key);
+}
+
+/* Remove id from the outstanding set; returns true when it was
+ * outstanding (and this response is therefore its first). */
+static bool gate_consume_id(uint32_t id) {
+    k_spinlock_key_t key = k_spin_lock(&gate_table_lock);
+    bool found = false;
+
+    gate_table_sync_gen();
+    for (int i = 0; i < gate_table_count; i++) {
+        if (gate_table_ids[i] == id) {
+            memmove(&gate_table_ids[i], &gate_table_ids[i + 1],
+                    (gate_table_count - i - 1) * sizeof(gate_table_ids[0]));
+            gate_table_count--;
+            found = true;
+            break;
+        }
+    }
+    k_spin_unlock(&gate_table_lock, key);
+    return found;
+}
+
+/* Downlink request observer (CDC in thread only): watches the bytes
+ * on their way into the downlink ring and registers the request_id
+ * at the head of each framed Request. Passive — it never alters,
+ * delays or drops the stream itself. */
+enum gate_down_state {
+    GATE_DOWN_WAIT_SOF,
+    GATE_DOWN_FIRST_TAG,
+    GATE_DOWN_ID_VARINT,
+    GATE_DOWN_IN_MSG,
+};
+
+static enum gate_down_state gate_down_state = GATE_DOWN_WAIT_SOF;
+static bool gate_down_escaped;
+static uint32_t gate_down_id;
+static uint8_t gate_down_id_bytes;
+
+static void gate_down_reset(void) {
+    gate_down_state = GATE_DOWN_WAIT_SOF;
+    gate_down_escaped = false;
+}
+
+static void gate_down_observe(uint8_t byte) {
+    if (gate_down_escaped) {
+        gate_down_escaped = false;
+        /* byte is a literal payload byte: fall through. */
+    } else if (byte == ESB_HID_STUDIO_SOF_BYTE) {
+        /* A SOF always (re)starts a message head, even mid-message
+         * (the framing layer's error recovery does the same). */
+        gate_down_state = GATE_DOWN_FIRST_TAG;
+        return;
+    } else if (byte == ESB_HID_STUDIO_EOF_BYTE) {
+        gate_down_state = GATE_DOWN_WAIT_SOF;
+        return;
+    } else if (byte == ESB_HID_STUDIO_ESC_BYTE && gate_down_state != GATE_DOWN_WAIT_SOF) {
+        gate_down_escaped = true;
+        return;
+    } else if (gate_down_state == GATE_DOWN_WAIT_SOF) {
+        return;
+    }
+
+    /* Payload byte. */
+    switch (gate_down_state) {
+    case GATE_DOWN_FIRST_TAG:
+        if (byte == GATE_TAG_REQUEST_ID) {
+            gate_down_id = 0;
+            gate_down_id_bytes = 0;
+            gate_down_state = GATE_DOWN_ID_VARINT;
+        } else {
+            /* First field is not request_id: with the field order
+             * every client encoder emits, that is the proto3-omitted
+             * zero ID — but only register 0 when the field really
+             * is a Request subsystem (fields 3/4/5, all
+             * length-delimited: tags 0x1A/0x22/0x2A). Any other head
+             * is not a Request this observer understands. */
+            if (byte == 0x1A || byte == 0x22 || byte == 0x2A) {
+                gate_register_id(0);
+            }
+            gate_down_state = GATE_DOWN_IN_MSG;
+        }
+        break;
+    case GATE_DOWN_ID_VARINT:
+        gate_down_id |= (uint32_t)(byte & 0x7F) << (7 * gate_down_id_bytes);
+        gate_down_id_bytes++;
+        if ((byte & 0x80) == 0) {
+            gate_register_id(gate_down_id);
+            gate_down_state = GATE_DOWN_IN_MSG;
+        } else if (gate_down_id_bytes >= 5) {
+            /* Not a uint32 varint: not a parseable request head. */
+            gate_down_state = GATE_DOWN_IN_MSG;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Uplink gate (CDC out thread only): parses each message head on
+ * the fly and latches a pass/drop decision for the whole message.
+ * While undecided, the head's raw bytes are held; a pass writes
+ * them out and streams the rest, a drop swallows the rest until
+ * EOF. The held bytes are raw wire bytes (ESC sequences included),
+ * so a passed message is forwarded byte-identically. */
+enum gate_up_state {
+    GATE_UP_WAIT_SOF,
+    GATE_UP_HDR_TAG,
+    GATE_UP_HDR_RR_LEN,
+    GATE_UP_HDR_ID_TAG,
+    GATE_UP_HDR_ID_VAL,
+    GATE_UP_PASS,
+    GATE_UP_DROP,
+};
+
+static enum gate_up_state gate_up_state = GATE_UP_WAIT_SOF;
+static bool gate_up_escaped;
+static uint8_t gate_up_hold[ESB_HID_STUDIO_GATE_HDR_MAX];
+static uint8_t gate_up_hold_len;
+static uint32_t gate_up_id;
+static uint8_t gate_up_varint_bytes;
+/* Generation the machine state belongs to; a chunk of a newer
+ * generation resets the machine before its first byte is fed. */
+static uint32_t gate_up_gen;
+
+static void gate_up_reset(void) {
+    gate_up_state = GATE_UP_WAIT_SOF;
+    gate_up_escaped = false;
+    gate_up_hold_len = 0;
+    gate_up_gen = studio_session_gen;
+}
+
+static void gate_up_decide_pass(void) {
+    for (int i = 0; i < gate_up_hold_len; i++) {
+        uart_poll_out(cdc_dev, gate_up_hold[i]);
+    }
+    gate_up_hold_len = 0;
+    gate_up_state = GATE_UP_PASS;
+}
+
+static void gate_up_decide_drop(const char *why) {
+    LOG_DBG("Studio uplink gate: dropping message (%s)", why);
+    up_gate_msg_drops++;
+    up_gate_byte_drops += gate_up_hold_len;
+    gate_up_hold_len = 0;
+    gate_up_state = GATE_UP_DROP;
+}
+
+static void gate_up_feed(uint8_t byte) {
+    if (gate_up_state == GATE_UP_WAIT_SOF) {
+        if (byte != ESB_HID_STUDIO_SOF_BYTE) {
+            /* Stale byte ahead of the next frame (post-flush junk
+             * or inter-message noise): drop it. */
+            return;
+        }
+        if (studio_await_sof) {
+            studio_await_sof = false;
+            LOG_INF("Studio uplink resynced (first SOF forwarded)");
+        }
+        gate_up_hold[0] = byte;
+        gate_up_hold_len = 1;
+        gate_up_escaped = false;
+        gate_up_state = GATE_UP_HDR_TAG;
+        return;
+    }
+
+    /* Inside a message: settle the framing role of this byte first.
+     * An escaped byte is literal payload even when it equals a
+     * framing byte. */
+    bool payload = true;
+
+    if (gate_up_escaped) {
+        gate_up_escaped = false;
+    } else if (byte == ESB_HID_STUDIO_ESC_BYTE) {
+        gate_up_escaped = true;
+        payload = false;
+    } else if (byte == ESB_HID_STUDIO_SOF_BYTE) {
+        /* Unescaped SOF mid-message: the sender aborted the frame
+         * (the reference framing decoder drops to its error state
+         * here). Restart the head parse with this SOF. A partial
+         * head that was never decided is framing garbage and stays
+         * unforwarded; count its held bytes as dropped. */
+        if (gate_up_state >= GATE_UP_HDR_TAG && gate_up_state <= GATE_UP_HDR_ID_VAL) {
+            up_gate_byte_drops += gate_up_hold_len;
+        }
+        gate_up_hold[0] = byte;
+        gate_up_hold_len = 1;
+        gate_up_state = GATE_UP_HDR_TAG;
+        return;
+    } else if (byte == ESB_HID_STUDIO_EOF_BYTE) {
+        if (gate_up_state == GATE_UP_PASS) {
+            uart_poll_out(cdc_dev, byte);
+        } else if (gate_up_state == GATE_UP_DROP) {
+            up_gate_byte_drops++;
+        } else {
+            /* EOF inside an undecided head: a truncated message.
+             * Nothing of it was forwarded; count it as dropped. */
+            up_gate_msg_drops++;
+            up_gate_byte_drops += gate_up_hold_len + 1;
+        }
+        gate_up_hold_len = 0;
+        gate_up_state = GATE_UP_WAIT_SOF;
+        return;
+    }
+
+    /* Ordinary byte (payload or ESC marker): route it by state. */
+    if (gate_up_state == GATE_UP_PASS) {
+        uart_poll_out(cdc_dev, byte);
+    } else if (gate_up_state == GATE_UP_DROP) {
+        up_gate_byte_drops++;
+    } else {
+        if (gate_up_hold_len >= sizeof(gate_up_hold)) {
+            /* A head longer than any parseable request head: give
+             * up on this message (this byte is swallowed too). */
+            gate_up_decide_drop("overlong head");
+            up_gate_byte_drops++;
+            return;
+        }
+        gate_up_hold[gate_up_hold_len++] = byte;
+    }
+
+    if (!payload) {
+        return;
+    }
+
+    /* Payload byte: advance the head parser while undecided. */
+    switch (gate_up_state) {
+    case GATE_UP_HDR_TAG:
+        if (byte == GATE_TAG_RESPONSE_RR) {
+            gate_up_varint_bytes = 0;
+            gate_up_state = GATE_UP_HDR_RR_LEN;
+        } else if (byte == GATE_TAG_RESPONSE_NOTIF) {
+            /* Notifications carry no request_id: they pass whenever
+             * the surrounding session gates let the stream through
+             * at all. */
+            gate_up_decide_pass();
+        } else {
+            gate_up_decide_drop("unknown Response head");
+        }
+        break;
+    case GATE_UP_HDR_RR_LEN:
+        gate_up_varint_bytes++;
+        if ((byte & 0x80) == 0) {
+            gate_up_state = GATE_UP_HDR_ID_TAG;
+        } else if (gate_up_varint_bytes >= 5) {
+            gate_up_decide_drop("overlong length varint");
+        }
+        break;
+    case GATE_UP_HDR_ID_TAG:
+        if (byte == GATE_TAG_REQUEST_ID) {
+            gate_up_id = 0;
+            gate_up_varint_bytes = 0;
+            gate_up_state = GATE_UP_HDR_ID_VAL;
+        } else if (gate_consume_id(0)) {
+            /* request_id omitted (proto3 zero) and a request really
+             * carried no ID in this session. */
+            gate_up_decide_pass();
+        } else {
+            gate_up_decide_drop("response without request_id");
+        }
+        break;
+    case GATE_UP_HDR_ID_VAL:
+        gate_up_id |= (uint32_t)(byte & 0x7F) << (7 * gate_up_varint_bytes);
+        gate_up_varint_bytes++;
+        if ((byte & 0x80) == 0) {
+            if (gate_consume_id(gate_up_id)) {
+                gate_up_decide_pass();
+            } else {
+                gate_up_decide_drop("unknown or already-answered request_id");
+            }
+        } else if (gate_up_varint_bytes >= 5) {
+            gate_up_decide_drop("overlong request_id varint");
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Session flush                                                       */
 
 /* Posted by esb_hid_studio_fwd_flush_session(); the purge itself runs
@@ -240,15 +630,19 @@ static void esb_studio_do_uplink_flush(void) {
  * session start, then reset them. Loader thread only. */
 static void esb_studio_report_hygiene(void) {
     if (up_stale_chunk_drops == 0 && up_unattended_byte_drops == 0 &&
-        down_unattended_byte_drops == 0) {
+        down_unattended_byte_drops == 0 && up_gate_msg_drops == 0) {
         return;
     }
     LOG_INF("Studio session hygiene: dropped %u stale uplink chunk(s), %u uplink byte(s) "
-            "and %u downlink byte(s) while no client was connected",
-            up_stale_chunk_drops, up_unattended_byte_drops, down_unattended_byte_drops);
+            "and %u downlink byte(s) while no client was connected; "
+            "request-id gate dropped %u message(s), %u byte(s)",
+            up_stale_chunk_drops, up_unattended_byte_drops, down_unattended_byte_drops,
+            up_gate_msg_drops, up_gate_byte_drops);
     up_stale_chunk_drops = 0;
     up_unattended_byte_drops = 0;
     down_unattended_byte_drops = 0;
+    up_gate_msg_drops = 0;
+    up_gate_byte_drops = 0;
 }
 
 /* Watch the CDC client's DTR edges: flush when a readable DTR drops
@@ -396,6 +790,7 @@ static void esb_studio_cdc_in_thread(void) {
              * must not enter the downlink ring, where it would head
              * the next session's request stream. */
             down_unattended_byte_drops++;
+            gate_down_reset();
             continue;
         }
 
@@ -403,6 +798,9 @@ static void esb_studio_cdc_in_thread(void) {
             LOG_WRN("Studio down-buffer full, dropping CDC byte");
             continue;
         }
+        /* The byte is on its way to the keyboard: let the gate
+         * observer note the request_id if this is a request head. */
+        gate_down_observe(byte);
         k_sem_give(&esb_studio_down_sem);
     }
 }
@@ -436,23 +834,23 @@ static void esb_studio_cdc_out_thread(void) {
             continue;
         }
 
+        if (chunk.gen != gate_up_gen) {
+            /* First chunk of a new session generation: any message
+             * the gate was in the middle of belonged to the dead
+             * session. */
+            gate_up_reset();
+        }
+
         for (int i = 0; i < chunk.len; i++) {
             if (chunk.gen != studio_session_gen) {
                 /* A flush ran while this chunk was being written:
                  * stop rather than finish a dead session's message
                  * into the next one. */
                 up_stale_chunk_drops++;
+                gate_up_reset();
                 break;
             }
-            if (studio_await_sof) {
-                if (chunk.data[i] != ESB_HID_STUDIO_SOF_BYTE) {
-                    /* Stale byte from a dead session: drop it. */
-                    continue;
-                }
-                studio_await_sof = false;
-                LOG_INF("Studio uplink resynced (first SOF forwarded)");
-            }
-            uart_poll_out(cdc_dev, chunk.data[i]);
+            gate_up_feed(chunk.data[i]);
         }
     }
 }
