@@ -103,6 +103,26 @@ static void registry_save(void) {
 #endif
 }
 
+/* ------------------------------------------------------------------ */
+/* USOver (US keyboard on a JP-layout host OS)                         */
+
+/* Persisted USOver switch ("esb_hid/usover", one byte). Default off;
+ * the receiver UI toggles it. Read at every keyboard report send, so
+ * toggling applies to the very next report. The conversion itself
+ * lives further down, next to the send path it rewrites. */
+static bool usover_enabled;
+
+static void usover_save(void) {
+#if IS_ENABLED(CONFIG_SETTINGS)
+    uint8_t v = usover_enabled ? 1 : 0;
+    int err = settings_save_one("esb_hid/usover", &v, sizeof(v));
+
+    if (err) {
+        LOG_ERR("Failed to save USOver setting: %d", err);
+    }
+#endif
+}
+
 #if IS_ENABLED(CONFIG_SETTINGS)
 static int esb_hid_rx_settings_set(const char *name, size_t len, settings_read_cb read_cb,
                                    void *cb_arg) {
@@ -146,6 +166,19 @@ static int esb_hid_rx_settings_set(const char *name, size_t len, settings_read_c
             return 0;
         }
         return -EINVAL;
+    }
+    if (settings_name_steq(name, "usover", &next) && !next) {
+        if (len != 1) {
+            return -EINVAL;
+        }
+        uint8_t v;
+        int rc = read_cb(cb_arg, &v, sizeof(v));
+
+        if (rc < 0) {
+            return rc;
+        }
+        usover_enabled = (v != 0);
+        return 0;
     }
     return -ENOENT;
 }
@@ -215,6 +248,7 @@ static void registry_load_once(void) {
     LOG_INF("ESB registry: active slot %d, used [%d %d %d %d]", registry.active_slot,
             registry.slots[0].used, registry.slots[1].used, registry.slots[2].used,
             registry.slots[3].used);
+    LOG_INF("USOver: %s", usover_enabled ? "on" : "off");
 }
 
 /* ------------------------------------------------------------------ */
@@ -756,6 +790,111 @@ static const uint8_t report_ids[] = {
     ZMK_HID_REPORT_ID_MOUSE,
 };
 
+/* USOver conversion table: (trigger usage, trigger needs shift) ->
+ * (replacement usage, replacement needs shift). This is the Keyboard
+ * Quantizer's us_key_on_jp_os_overrides list (its UJ OVR mode)
+ * transcribed to HID usages, with the JP_* keycodes resolved through
+ * QMK's keymap_japanese.h. The host OS is set to the JP layout while
+ * the keyboard sends US usages; each entry rewrites one punctuation
+ * key so the character printed on the keycap comes out. Unshifted
+ * GRV maps to JP_GRV (the backtick character), as in the Quantizer's
+ * Windows variant — while USOver is on, that key no longer acts as
+ * the half/full-width toggle (Alt+GRV still toggles the IME). */
+struct usover_entry {
+    uint8_t trigger;
+    bool trigger_shift;
+    uint8_t replacement;
+    bool replacement_shift;
+};
+
+static const struct usover_entry usover_table[] = {
+    {0x35, true, 0x2E, true},   /* ~ -> JP_TILD */
+    {0x35, false, 0x2F, true},  /* ` -> JP_GRV */
+    {0x1F, true, 0x2F, false},  /* @ -> JP_AT */
+    {0x23, true, 0x2E, false},  /* ^ -> JP_CIRC */
+    {0x24, true, 0x23, true},   /* & -> JP_AMPR */
+    {0x25, true, 0x34, true},   /* * -> JP_ASTR */
+    {0x26, true, 0x25, true},   /* ( -> JP_LPRN */
+    {0x27, true, 0x26, true},   /* ) -> JP_RPRN */
+    {0x2D, true, 0x87, true},   /* _ -> JP_UNDS */
+    {0x2E, false, 0x2D, true},  /* = -> JP_EQL */
+    {0x2E, true, 0x33, true},   /* + -> JP_PLUS */
+    {0x2F, false, 0x30, false}, /* [ -> JP_LBRC */
+    {0x2F, true, 0x30, true},   /* { -> JP_LCBR */
+    {0x30, false, 0x32, false}, /* ] -> JP_RBRC */
+    {0x30, true, 0x32, true},   /* } -> JP_RCBR */
+    {0x31, false, 0x87, false}, /* backslash -> JP_BSLS */
+    {0x31, true, 0x89, true},   /* | -> JP_PIPE */
+    {0x33, true, 0x34, false},  /* : -> JP_COLN */
+    {0x34, false, 0x24, true},  /* ' -> JP_QUOT */
+    {0x34, true, 0x1F, true},   /* " -> JP_DQUO */
+};
+
+#define USOVER_MOD_LSHIFT 0x02
+#define USOVER_MOD_RSHIFT 0x20
+#define USOVER_MOD_SHIFT_MASK (USOVER_MOD_LSHIFT | USOVER_MOD_RSHIFT)
+/* Keyboard bodies are a modifier byte plus the NKRO bitmap (20 bytes
+ * at the largest usage ZMK reports); anything longer is not a plain
+ * keyboard body and is passed through untransformed. */
+#define USOVER_BODY_MAX 32
+
+/* Rewrite a keyboard report body (modifier byte + NKRO bitmap) per
+ * the USOver table. Triggers are matched against a snapshot of the
+ * original bitmap, so a replacement usage that is itself a trigger
+ * (e.g. [ -> ]) is never rewritten a second time. If several
+ * overridden keys are held at once and their replacements disagree
+ * on shift, the last match wins the shift bits — the compromise a
+ * single-report forwarder has to make; letters, digits and
+ * unshifted keys are unaffected. */
+static void usover_transform(uint8_t *body, size_t len) {
+    if (len < 2 || len > USOVER_BODY_MAX) {
+        return;
+    }
+    uint8_t orig[USOVER_BODY_MAX];
+
+    memcpy(orig, body, len);
+    bool shift = (orig[0] & USOVER_MOD_SHIFT_MASK) != 0;
+    bool applied = false;
+    bool out_shift = shift;
+
+    for (size_t i = 0; i < ARRAY_SIZE(usover_table); i++) {
+        const struct usover_entry *e = &usover_table[i];
+        size_t tbyte = 1 + e->trigger / 8;
+
+        if (tbyte >= len || !(orig[tbyte] & BIT(e->trigger % 8)) ||
+            e->trigger_shift != shift) {
+            continue;
+        }
+        body[tbyte] &= (uint8_t)~BIT(e->trigger % 8);
+        size_t rbyte = 1 + e->replacement / 8;
+
+        if (rbyte < len) {
+            body[rbyte] |= (uint8_t)BIT(e->replacement % 8);
+        }
+        applied = true;
+        out_shift = e->replacement_shift;
+    }
+    if (applied) {
+        body[0] = (body[0] & (uint8_t)~USOVER_MOD_SHIFT_MASK) |
+                  (out_shift ? USOVER_MOD_LSHIFT : 0);
+    }
+}
+
+/* The one choke point for HID reports on their way to the host:
+ * live forwarding, slot-switch re-injection and release all pass
+ * through here, so USOver applies uniformly. Callers hold
+ * esb_hid_rx_mutex. */
+static int rx_send_hid(uint8_t type, const uint8_t *body, size_t len) {
+    uint8_t buf[ESB_HID_CACHE_BODY_MAX];
+
+    if (type == ESB_HID_TYPE_KEYBOARD && usover_enabled && len <= sizeof(buf)) {
+        memcpy(buf, body, len);
+        usover_transform(buf, len);
+        body = buf;
+    }
+    return zmk_usb_hid_send_report_with_id(report_ids[type], body, len);
+}
+
 int esb_hid_rx_set_active_slot(uint8_t slot) {
     if (slot >= ESB_HID_SLOT_COUNT) {
         return -EINVAL;
@@ -779,7 +918,7 @@ int esb_hid_rx_set_active_slot(uint8_t slot) {
         if (peers[old_slot].hid_cache[type].valid) {
             uint8_t zeroed[ESB_HID_CACHE_BODY_MAX] = {0};
 
-            zmk_usb_hid_send_report_with_id(report_ids[type], zeroed,
+            rx_send_hid(type, zeroed,
                                             peers[old_slot].hid_cache[type].len);
         }
     }
@@ -812,12 +951,54 @@ int esb_hid_rx_set_active_slot(uint8_t slot) {
             }
         }
         if (nonzero) {
-            zmk_usb_hid_send_report_with_id(report_ids[type], peers[slot].hid_cache[type].body,
+            rx_send_hid(type, peers[slot].hid_cache[type].body,
                                             peers[slot].hid_cache[type].len);
         }
     }
 
     LOG_INF("Active slot: %d -> %d (\"%s\")", old_slot, slot, registry.slots[slot].name);
+    k_mutex_unlock(&esb_hid_rx_mutex);
+    return 0;
+}
+
+bool esb_hid_rx_usover_enabled(void) { return usover_enabled; }
+
+int esb_hid_rx_usover_set(bool enabled) {
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    if (enabled == usover_enabled) {
+        k_mutex_unlock(&esb_hid_rx_mutex);
+        return 0;
+    }
+    usover_enabled = enabled;
+    usover_save();
+    LOG_INF("USOver: %s", enabled ? "on" : "off");
+
+    /* Re-issue the active keyboard's held state under the new mode:
+     * release everything first (an all-zero body releases in any
+     * mapping), then re-inject the cached body through the send
+     * path so it is transformed under the new setting. Without this,
+     * a key held across the toggle would stay stuck in the mapping
+     * it was pressed with. */
+    uint8_t active = registry.active_slot;
+
+    if (active < ESB_HID_SLOT_COUNT && registry.slots[active].used &&
+        peers[active].hid_cache[ESB_HID_TYPE_KEYBOARD].valid) {
+        size_t len = peers[active].hid_cache[ESB_HID_TYPE_KEYBOARD].len;
+        uint8_t zeroed[ESB_HID_CACHE_BODY_MAX] = {0};
+        bool nonzero = false;
+
+        for (size_t i = 0; i < len; i++) {
+            if (peers[active].hid_cache[ESB_HID_TYPE_KEYBOARD].body[i] != 0) {
+                nonzero = true;
+                break;
+            }
+        }
+        zmk_usb_hid_send_report_with_id(report_ids[ESB_HID_TYPE_KEYBOARD], zeroed, len);
+        if (nonzero) {
+            rx_send_hid(ESB_HID_TYPE_KEYBOARD,
+                        peers[active].hid_cache[ESB_HID_TYPE_KEYBOARD].body, len);
+        }
+    }
     k_mutex_unlock(&esb_hid_rx_mutex);
     return 0;
 }
@@ -877,7 +1058,7 @@ int esb_hid_rx_delete_slot(uint8_t slot) {
             if (peers[slot].hid_cache[type].valid) {
                 uint8_t zeroed[ESB_HID_CACHE_BODY_MAX] = {0};
 
-                zmk_usb_hid_send_report_with_id(report_ids[type], zeroed,
+                rx_send_hid(type, zeroed,
                                                 peers[slot].hid_cache[type].len);
             }
         }
@@ -1234,7 +1415,7 @@ static void handle_payload(const struct esb_payload *payload) {
         peer->hid_cache[type].valid = true;
 
         if (forward) {
-            int err = zmk_usb_hid_send_report_with_id(report_ids[type], body, body_len);
+            int err = rx_send_hid(type, body, body_len);
 
             if (err) {
                 LOG_WRN("USB HID forward failed (type %d): %d", type, err);
@@ -1265,6 +1446,69 @@ static void rx_thread(void) {
 }
 
 K_THREAD_DEFINE(esb_hid_rx_thread, 1024, rx_thread, NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, 0);
+
+/* ------------------------------------------------------------------ */
+/* Active-slot failover                                                */
+
+/* When the active keyboard has been silent past the link-lost
+ * timeout (ESB_HID_LINK_LOST_TIMEOUT_MS — the same 15 s the display
+ * greys it out at, three missed 5 s status frames), hand active to
+ * the freshest other registered keyboard that is still on the air,
+ * so typing continues on the surviving keyboard instead of dying
+ * with the one that was switched off or walked away. There is no
+ * automatic fail-back: when the original keyboard returns it does
+ * not steal active back (the user can switch manually), which also
+ * keeps two keyboards at the edge of range from flapping active
+ * between them. The switch itself is esb_hid_rx_set_active_slot(),
+ * with its usual release / Studio flush / re-inject contract. */
+#define ESB_HID_ACTIVE_WATCHDOG_MS 1000
+
+static void active_watchdog(struct k_work *work);
+
+static K_WORK_DELAYABLE_DEFINE(active_watchdog_work, active_watchdog);
+
+static void active_watchdog(struct k_work *work) {
+    k_work_reschedule(&active_watchdog_work, K_MSEC(ESB_HID_ACTIVE_WATCHDOG_MS));
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_AUTO_ACTIVE)
+    uint8_t target = ESB_HID_SLOT_COUNT;
+
+    k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
+    uint8_t active = registry.active_slot;
+    bool pairing_busy = (pairing.state != ESB_HID_PAIRING_IDLE);
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING)
+    pairing_busy = pairing_busy || boot_pairing_armed;
+#endif
+
+    if (active < ESB_HID_SLOT_COUNT && registry.slots[active].used && !pairing_busy &&
+        peers[active].last_seen_ms != 0) {
+        int64_t now = k_uptime_get();
+
+        if (now - peers[active].last_seen_ms > ESB_HID_LINK_LOST_TIMEOUT_MS) {
+            int64_t freshest = 0;
+
+            for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
+                if (i == active || !registry.slots[i].used || peers[i].last_seen_ms == 0) {
+                    continue;
+                }
+                if (now - peers[i].last_seen_ms <= ESB_HID_LINK_LOST_TIMEOUT_MS &&
+                    peers[i].last_seen_ms > freshest) {
+                    freshest = peers[i].last_seen_ms;
+                    target = (uint8_t)i;
+                }
+            }
+        }
+    }
+    k_mutex_unlock(&esb_hid_rx_mutex);
+
+    if (target < ESB_HID_SLOT_COUNT) {
+        LOG_INF("Active slot %d silent past %d ms; failing over to slot %d", active,
+                ESB_HID_LINK_LOST_TIMEOUT_MS, target);
+        esb_hid_rx_set_active_slot(target);
+    }
+#endif /* IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_AUTO_ACTIVE) */
+}
 
 static void rx_link_retry(struct k_work *work);
 
@@ -1309,6 +1553,9 @@ static int esb_hid_rx_init(void) {
      * original error to the not-yet-attached USB console. */
     LOG_INF("esb_hid: RX init, first link start in 6s (ESBHID-3)");
     k_work_schedule(&rx_link_retry_work, K_SECONDS(6));
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_AUTO_ACTIVE)
+    k_work_schedule(&active_watchdog_work, K_SECONDS(7));
+#endif
     return 0;
 }
 

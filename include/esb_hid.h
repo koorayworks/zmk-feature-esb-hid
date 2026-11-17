@@ -41,6 +41,13 @@ int esb_hid_rx_set_active_slot(uint8_t slot); /* -EINVAL if slot>=4 or slot unus
 int esb_hid_rx_get_slot_info(uint8_t slot, struct esb_hid_slot_info *out);
 int esb_hid_rx_delete_slot(uint8_t slot); /* clears registry entry + saves */
 
+/* USOver: make US-layout keyboards type as labelled on a host OS set
+ * to the JP layout (the Keyboard Quantizer's UJ OVR mapping, applied
+ * to keyboard reports on the way to USB HID). Persisted in settings
+ * ("esb_hid/usover", default off); toggled from the receiver UI. */
+bool esb_hid_rx_usover_enabled(void);
+int esb_hid_rx_usover_set(bool enabled);
+
 enum esb_hid_pairing_state {
     ESB_HID_PAIRING_IDLE = 0,
     ESB_HID_PAIRING_SEARCHING,
