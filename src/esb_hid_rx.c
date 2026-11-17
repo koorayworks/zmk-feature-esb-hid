@@ -838,6 +838,12 @@ static const struct usover_entry usover_table[] = {
  * keyboard body and is passed through untransformed. */
 #define USOVER_BODY_MAX 32
 
+/* The key bitmap in a ZMK keyboard report body starts after the
+ * modifier byte AND a reserved byte (zmk_hid_keyboard_report_body:
+ * modifiers, _reserved, keys[]). Indexing from byte 1 instead shifts
+ * every conversion by 8 usages — that was the first USOver bug. */
+#define USOVER_BITMAP_OFFSET 2
+
 /* Rewrite a keyboard report body (modifier byte + NKRO bitmap) per
  * the USOver table. Triggers are matched against a snapshot of the
  * original bitmap, so a replacement usage that is itself a trigger
@@ -859,14 +865,14 @@ static void usover_transform(uint8_t *body, size_t len) {
 
     for (size_t i = 0; i < ARRAY_SIZE(usover_table); i++) {
         const struct usover_entry *e = &usover_table[i];
-        size_t tbyte = 1 + e->trigger / 8;
+        size_t tbyte = USOVER_BITMAP_OFFSET + e->trigger / 8;
 
         if (tbyte >= len || !(orig[tbyte] & BIT(e->trigger % 8)) ||
             e->trigger_shift != shift) {
             continue;
         }
         body[tbyte] &= (uint8_t)~BIT(e->trigger % 8);
-        size_t rbyte = 1 + e->replacement / 8;
+        size_t rbyte = USOVER_BITMAP_OFFSET + e->replacement / 8;
 
         if (rbyte < len) {
             body[rbyte] |= (uint8_t)BIT(e->replacement % 8);
@@ -887,10 +893,25 @@ static void usover_transform(uint8_t *body, size_t len) {
 static int rx_send_hid(uint8_t type, const uint8_t *body, size_t len) {
     uint8_t buf[ESB_HID_CACHE_BODY_MAX];
 
-    if (type == ESB_HID_TYPE_KEYBOARD && usover_enabled && len <= sizeof(buf)) {
+    if (type == ESB_HID_TYPE_KEYBOARD && len <= sizeof(buf)) {
+        /* The report this receiver declares to the host is its own,
+         * and a transmitter's body can be shorter (a build without
+         * the extended NKRO usages sends 19 bytes where this build
+         * declares 21): zero-pad to this build's body size so the
+         * declared bitmap is always sent in full — the USOver
+         * replacements at INT1/INT3 live in those tail bytes. */
+        size_t send_len = len;
+
+        if (send_len < sizeof(struct zmk_hid_keyboard_report_body)) {
+            send_len = sizeof(struct zmk_hid_keyboard_report_body);
+        }
+        memset(buf, 0, send_len);
         memcpy(buf, body, len);
-        usover_transform(buf, len);
+        if (usover_enabled) {
+            usover_transform(buf, send_len);
+        }
         body = buf;
+        len = send_len;
     }
     return zmk_usb_hid_send_report_with_id(report_ids[type], body, len);
 }
@@ -993,7 +1014,7 @@ int esb_hid_rx_usover_set(bool enabled) {
                 break;
             }
         }
-        zmk_usb_hid_send_report_with_id(report_ids[ESB_HID_TYPE_KEYBOARD], zeroed, len);
+        rx_send_hid(ESB_HID_TYPE_KEYBOARD, zeroed, len);
         if (nonzero) {
             rx_send_hid(ESB_HID_TYPE_KEYBOARD,
                         peers[active].hid_cache[ESB_HID_TYPE_KEYBOARD].body, len);
