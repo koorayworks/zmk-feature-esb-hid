@@ -57,7 +57,9 @@
  *   request_id is currently outstanding for this session (registered
  *   by a passive observer on the downlink), consuming the entry as
  *   it passes; anything else is swallowed whole. Notifications
- *   carry no request ID and pass whenever the stream itself does.
+ *   carry no request ID and pass whenever the stream itself does,
+ *   and so do meta error responses, which ZMK's core builds
+ *   without an ID for requests it cannot route to any subsystem.
  *   See the gate section below for the exact rules.
  */
 
@@ -214,6 +216,24 @@ static bool esb_studio_cdc_connected(void) {
  * treat as ID 0. A head that parses neither way is dropped as
  * unparseable rather than passed on faith.
  *
+ * One ID-less shape is passed rather than dropped: a
+ * RequestResponse whose first field is the meta field (tag 0x12
+ * at that position). ZMK's core answers a request it cannot route
+ * to any registered subsystem — a stock keyboard probed for a
+ * custom subsystem it does not have, say — with a meta
+ * simple_error, and handle_request in app/src/studio/rpc.c
+ * returns that response before the request_id is patched in, so
+ * it is built with the ID still zero and proto3 omits the field
+ * on the wire entirely (verified against rpc.c and
+ * zmk-studio-messages' studio.proto / meta.proto). No encoder
+ * ever puts response data behind that field: a meta message
+ * carries only an error condition or a no-response marker, and
+ * clients already shrug at receiving one whose ID does not match
+ * (MyKeebStudio logs the mismatch and carries on), so passing it
+ * cannot poison a session the way a stale data response can. The
+ * strict rule is unchanged for every data-carrying response: an
+ * echoed ID that is not outstanding is still swallowed whole.
+ *
  * Neither parser ever buffers a whole message (the receiver's RAM
  * is nearly full): the uplink gate holds only the raw bytes of the
  * current message head — SOF, the Response tag, the submessage
@@ -258,6 +278,9 @@ static bool esb_studio_cdc_connected(void) {
 #define GATE_TAG_REQUEST_ID 0x08     /* field 1, varint (both directions) */
 #define GATE_TAG_RESPONSE_RR 0x0A    /* Response field 1: RequestResponse */
 #define GATE_TAG_RESPONSE_NOTIF 0x12 /* Response field 2: Notification */
+#define GATE_TAG_RR_META 0x12        /* RequestResponse field 2: meta — the same
+                                      * byte value as the Response-level
+                                      * notification tag, one message deeper */
 
 /* Gate hygiene counters, reported (and reset) with the rest of the
  * session hygiene counters at the next session start. */
@@ -555,6 +578,16 @@ static void gate_up_feed(uint8_t byte) {
         } else if (gate_consume_id(0)) {
             /* request_id omitted (proto3 zero) and a request really
              * carried no ID in this session. */
+            gate_up_decide_pass();
+        } else if (byte == GATE_TAG_RR_META) {
+            /* First field of the RequestResponse is the meta field
+             * and no ID-0 request is outstanding: this is the
+             * ID-less meta error ZMK's core builds for a request it
+             * could not route to any subsystem, which by
+             * construction never carries an echoed ID (see the gate
+             * note above). It holds only an error condition, so it
+             * passes like a notification does; data responses keep
+             * the strict outstanding-ID rule. */
             gate_up_decide_pass();
         } else {
             gate_up_decide_drop("response without request_id");
