@@ -797,9 +797,10 @@ static const uint8_t report_ids[] = {
  * QMK's keymap_japanese.h. The host OS is set to the JP layout while
  * the keyboard sends US usages; each entry rewrites one punctuation
  * key so the character printed on the keycap comes out. Unshifted
- * GRV maps to JP_GRV (the backtick character), as in the Quantizer's
- * Windows variant — while USOver is on, that key no longer acts as
- * the half/full-width toggle (Alt+GRV still toggles the IME). */
+ * GRV is deliberately NOT overridden: the JP host OS already treats
+ * that usage as the half/full-width (Zenkaku/Hankaku) key, and the
+ * user wants the IME toggle kept (the Quantizer's UJ HW variant
+ * makes the same choice). Shifted GRV still maps to ~ above. */
 struct usover_entry {
     uint8_t trigger;
     bool trigger_shift;
@@ -809,7 +810,6 @@ struct usover_entry {
 
 static const struct usover_entry usover_table[] = {
     {0x35, true, 0x2E, true},   /* ~ -> JP_TILD */
-    {0x35, false, 0x2F, true},  /* ` -> JP_GRV */
     {0x1F, true, 0x2F, false},  /* @ -> JP_AT */
     {0x23, true, 0x2E, false},  /* ^ -> JP_CIRC */
     {0x24, true, 0x23, true},   /* & -> JP_AMPR */
