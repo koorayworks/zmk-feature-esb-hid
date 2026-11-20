@@ -632,6 +632,11 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len) {
 #define ESB_HID_HEARTBEAT_ACTIVE_SEC 5
 #define ESB_HID_HEARTBEAT_IDLE_SEC 30
 #define ESB_HID_HEARTBEAT_QUIET_SEC 60
+/* While the selected output is not ESB (BLE / USB / none), the ESB
+ * heartbeat only keeps the receiver's status display warm; stretch
+ * it to the quiet period so a keyboard used over BLE does not spend
+ * battery reporting to a receiver its keystrokes bypass anyway. */
+#define ESB_HID_HEARTBEAT_OFFPATH_SEC 60
 #define ESB_HID_ACTIVITY_WINDOW_MS 60000
 
 static volatile int64_t last_user_activity_ms;
@@ -642,6 +647,9 @@ static uint8_t status_period_sec = ESB_HID_HEARTBEAT_ACTIVE_SEC;
 static uint8_t current_heartbeat_sec(void) {
     if (host_quiet) {
         return ESB_HID_HEARTBEAT_QUIET_SEC;
+    }
+    if (zmk_endpoint_get_selected().transport != ZMK_TRANSPORT_ESB) {
+        return ESB_HID_HEARTBEAT_OFFPATH_SEC;
     }
     if (last_user_activity_ms == 0 ||
         k_uptime_get() - last_user_activity_ms < ESB_HID_ACTIVITY_WINDOW_MS) {
