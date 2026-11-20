@@ -469,6 +469,9 @@ static void hunt_cancel(void);
 /* Slot identity handler (defined in the link monitor section). */
 static void identity_handle(const uint8_t *body, size_t len);
 
+/* Host state handler (defined in the status frames section). */
+static void host_state_handle(uint8_t flags);
+
 #if IS_ENABLED(CONFIG_ZMK_ESB_HID_STUDIO)
 /* Studio helpers (defined in the Studio section below). */
 static void studio_note_activity(void);
@@ -507,6 +510,9 @@ static void drain_ack_payloads(void) {
             break;
         case ESB_HID_TYPE_SLOT_IDENTITY:
             identity_handle(body, body_len);
+            break;
+        case ESB_HID_TYPE_HOST_STATE:
+            host_state_handle(body[0]);
             break;
         default:
             LOG_DBG("Ignoring unexpected ACK payload type %d (len %d)", payload.data[0],
@@ -613,12 +619,41 @@ static int enqueue_report(uint8_t type, const uint8_t *body, size_t len) {
 /* ------------------------------------------------------------------ */
 /* Status frames (battery / layer)                                     */
 
-#define ESB_HID_STATUS_HEARTBEAT K_SECONDS(5)
+/* Adaptive status heartbeat (power saving, 2026-11-20). While the
+ * user is active the period is 5 s, as it always was. After 60 s
+ * without user activity (key/mouse reports, layer/battery/endpoint
+ * events) it stretches to 30 s, and while the receiver reports the
+ * USB host asleep (ESB_HID_TYPE_HOST_STATE) it stretches to 60 s.
+ * The current period travels in every status frame (status v5
+ * trailer) so the receiver derives its link-lost timeout from the
+ * declared value instead of assuming 5 s; whenever the period
+ * changes, a snapshot goes out immediately so the receiver learns
+ * the new value at once rather than at the next heartbeat. */
+#define ESB_HID_HEARTBEAT_ACTIVE_SEC 5
+#define ESB_HID_HEARTBEAT_IDLE_SEC 30
+#define ESB_HID_HEARTBEAT_QUIET_SEC 60
+#define ESB_HID_ACTIVITY_WINDOW_MS 60000
+
+static volatile int64_t last_user_activity_ms;
+static bool host_quiet;
+/* Period declared by the most recent status snapshot. */
+static uint8_t status_period_sec = ESB_HID_HEARTBEAT_ACTIVE_SEC;
+
+static uint8_t current_heartbeat_sec(void) {
+    if (host_quiet) {
+        return ESB_HID_HEARTBEAT_QUIET_SEC;
+    }
+    if (last_user_activity_ms == 0 ||
+        k_uptime_get() - last_user_activity_ms < ESB_HID_ACTIVITY_WINDOW_MS) {
+        return ESB_HID_HEARTBEAT_ACTIVE_SEC;
+    }
+    return ESB_HID_HEARTBEAT_IDLE_SEC;
+}
 
 /* The first few status frames after boot carry ESB_HID_STATUS_FLAG_BOOT
  * so the receiver can edge-detect this reboot and flush the Studio
  * session state it holds for the previous boot. Snapshots fire on
- * layer/battery events plus the 5 s heartbeat (the first at link
+ * layer/battery events plus the periodic heartbeat (the first at link
  * start +1 s); 3 flagged sends are redundancy against loss, and every
  * status frame is itself retried by send_frame(). */
 static uint8_t status_boot_countdown = 3;
@@ -655,6 +690,9 @@ static uint8_t status_output_flags(void) {
 }
 
 static void send_status_snapshot(void) {
+    /* Every snapshot declares the period currently in effect. */
+    status_period_sec = current_heartbeat_sec();
+
     struct esb_hid_status_body body = {
         .battery = ESB_HID_BATTERY_UNKNOWN,
         .layer = (uint8_t)zmk_keymap_highest_layer_active(),
@@ -676,9 +714,10 @@ static void send_status_snapshot(void) {
      * [layer_name] trailer after the v2 name trailer. Layer names
      * are ASCII display-names, so truncating to
      * ESB_HID_LAYER_NAME_MAX bytes is fine. Status v4: append the
-     * 1-byte peer battery after the layer-name trailer.
-     * Frame buffer sizing: 4 + 1+16 + 1+16 + 1 = 39 body bytes max. */
-    uint8_t frame_body[sizeof(body) + 1 + ESB_HID_NAME_MAX + 1 + ESB_HID_LAYER_NAME_MAX + 1];
+     * 1-byte peer battery after the layer-name trailer. Status v5:
+     * append the 1-byte heartbeat period (seconds) after that.
+     * Frame buffer sizing: 4 + 1+16 + 1+16 + 1 + 1 = 40 body bytes max. */
+    uint8_t frame_body[sizeof(body) + 1 + ESB_HID_NAME_MAX + 1 + ESB_HID_LAYER_NAME_MAX + 1 + 1];
     char name[ESB_HID_NAME_MAX + 1];
     size_t name_len = own_name(name);
 
@@ -697,20 +736,64 @@ static void send_status_snapshot(void) {
         memcpy(&frame_body[sizeof(body) + 1 + name_len + 1], layer_name_str, layer_name_len);
     }
     frame_body[sizeof(body) + 1 + name_len + 1 + layer_name_len] = status_peer_battery;
+    frame_body[sizeof(body) + 1 + name_len + 1 + layer_name_len + 1] = status_period_sec;
 
     enqueue_report(ESB_HID_TYPE_STATUS, frame_body,
-                   sizeof(body) + 1 + name_len + 1 + layer_name_len + 1);
+                   sizeof(body) + 1 + name_len + 1 + layer_name_len + 1 + 1);
 }
 
 static void status_heartbeat(struct k_work *work) {
     ARG_UNUSED(work);
     send_status_snapshot();
-    k_work_reschedule(k_work_delayable_from_work(work), ESB_HID_STATUS_HEARTBEAT);
+    k_work_reschedule(k_work_delayable_from_work(work), K_SECONDS(status_period_sec));
 }
 
 static K_WORK_DELAYABLE_DEFINE(status_work, status_heartbeat);
 
+/* Record user activity (key/mouse report, layer/battery/endpoint
+ * event). Activity ends the host-quiet state at once — the frame
+ * that follows is what wakes the host through the receiver's USB
+ * remote wakeup — and snaps the heartbeat back to the active
+ * period. When the period actually changes, declare it immediately
+ * with a snapshot instead of waiting for the next heartbeat. */
+static void note_user_activity(void) {
+    last_user_activity_ms = k_uptime_get();
+
+    if (host_quiet) {
+        host_quiet = false;
+        LOG_INF("esb_hid: local activity, leaving host-quiet state");
+    }
+
+    if (current_heartbeat_sec() != status_period_sec) {
+        send_status_snapshot();
+        k_work_reschedule(&status_work, K_SECONDS(status_period_sec));
+    }
+}
+
+/* ESB_HID_TYPE_HOST_STATE from the receiver: the USB host fell
+ * asleep (go quiet: stretch the heartbeat to the quiet period) or
+ * woke up (back to the activity-driven period). Either way the new
+ * period is declared with an immediate snapshot. Keyboards paired
+ * with older receivers never see this frame and simply keep the
+ * activity-driven period. */
+static void host_state_handle(uint8_t flags) {
+    bool asleep = (flags & ESB_HID_HOST_STATE_ASLEEP) != 0;
+
+    if (asleep == host_quiet) {
+        return;
+    }
+    host_quiet = asleep;
+    LOG_INF("esb_hid: host %s, heartbeat now %d s", asleep ? "asleep" : "awake",
+            current_heartbeat_sec());
+    send_status_snapshot();
+    k_work_reschedule(&status_work, K_SECONDS(status_period_sec));
+}
+
 static int esb_hid_tx_listener(const zmk_event_t *eh) {
+    /* Layer/battery/endpoint events count as user activity for the
+     * adaptive heartbeat (and end the host-quiet state). */
+    note_user_activity();
+
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
     if (as_zmk_battery_state_changed(eh) != NULL) {
         send_status_snapshot();
@@ -919,15 +1002,18 @@ int esb_hid_tx_start_pairing(void) {
 bool zmk_esb_hid_is_ready(void) { return link_ready; }
 
 int zmk_esb_hid_send_keyboard_report(struct zmk_hid_keyboard_report_body *body) {
+    note_user_activity();
     return enqueue_report(ESB_HID_TYPE_KEYBOARD, (const uint8_t *)body, sizeof(*body));
 }
 
 int zmk_esb_hid_send_consumer_report(struct zmk_hid_consumer_report_body *body) {
+    note_user_activity();
     return enqueue_report(ESB_HID_TYPE_CONSUMER, (const uint8_t *)body, sizeof(*body));
 }
 
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
 int zmk_esb_hid_send_mouse_report(struct zmk_hid_mouse_report_body *body) {
+    note_user_activity();
     return enqueue_report(ESB_HID_TYPE_MOUSE, (const uint8_t *)body, sizeof(*body));
 }
 #endif /* IS_ENABLED(CONFIG_ZMK_POINTING) */
@@ -935,14 +1021,17 @@ int zmk_esb_hid_send_mouse_report(struct zmk_hid_mouse_report_body *body) {
 /* ------------------------------------------------------------------ */
 /* Link monitor and receiver hunting (multi-receiver)                  */
 
-/* Presence is judged by status frames only: they flow on the 5 s
- * heartbeat even while the user is idle, whereas key/mouse frames
- * can fail in bursts for unrelated reasons (queue pressure, one
- * noisy moment) and must not trigger a receiver switch on their
- * own. A receiver is declared gone after this many consecutive
- * failed status sends, which also bounds the detection time to
- * roughly 15 s -- the same order as the receiver's own link-lost
- * timeout (ESB_HID_LINK_LOST_TIMEOUT_MS). */
+/* Presence is judged by status frames only: they flow on the
+ * status heartbeat even while the user is idle, whereas key/mouse
+ * frames can fail in bursts for unrelated reasons (queue pressure,
+ * one noisy moment) and must not trigger a receiver switch on
+ * their own. A receiver is declared gone after this many
+ * consecutive failed status sends; at the active 5 s period that
+ * bounds the detection time to roughly 15 s — the same order as
+ * the receiver's own link-lost timeout
+ * (ESB_HID_LINK_LOST_TIMEOUT_MS). The adaptive heartbeat stretches
+ * both detections together when idle or host-quiet; that is the
+ * accepted price of the power saving. */
 #define ESB_HID_LINK_FAIL_THRESHOLD 3
 /* While hunting, one pass probes every profile once; passes repeat
  * at most this often, with a short gap between two candidates, so
@@ -1286,6 +1375,9 @@ static void link_retry(struct k_work *work) {
     }
 
     link_ready = true;
+    /* Boot counts as activity: the heartbeat starts at the active
+     * period and only stretches after a full idle window. */
+    last_user_activity_ms = k_uptime_get();
     /* With several known receivers, find out which one is actually
      * around before settling: probe them in rotation, starting from
      * the most recently confirmed one. A single profile skips this

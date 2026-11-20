@@ -36,6 +36,20 @@ config ZMK_ESB_HID_SLOT
 	  during pairing is stored in settings ("esb_hid/slot") and takes
 	  precedence over this build-time default.
 
+config ZMK_ESB_HID_TX_OUTPUT_POWER
+	int "ESB transmit output power on the keyboard side (dBm)"
+	depends on ZMK_ESB_HID
+	range -20 8
+	default 0
+	help
+	  Radio transmit power for the keyboard (PTX) side of the ESB
+	  link. The receiver (PRX) is USB powered and keeps +4 dBm;
+	  only the battery-powered keyboard side is lowered. 0 dBm is
+	  ample for a receiver on the same desk and cuts the current
+	  of every transmitted frame (key/mouse reports and the status
+	  heartbeat alike). Raise it if the link gets unreliable at
+	  the intended distance.
+
 config ZMK_ESB_HID_MULTI_RECEIVER
 	bool "Remember multiple receivers and auto-select between them (keyboard side)"
 	depends on ZMK_ESB_HID

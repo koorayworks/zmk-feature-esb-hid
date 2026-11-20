@@ -22,9 +22,22 @@
 #define ESB_HID_STATUS_OUTPUT_NONE 3
 
 /* A keyboard counts as lost when no frame of any type has been
- * received from it for this long. The TX status heartbeat period is
- * 5 s, so this is two missed heartbeats plus a safety margin. */
+ * received from it for this long. With the original fixed 5 s TX
+ * status heartbeat this is two missed heartbeats plus a safety
+ * margin. Status v5 keyboards declare their current (adaptive)
+ * heartbeat period; use esb_hid_link_lost_timeout_ms() to get the
+ * effective timeout for a peer. */
 #define ESB_HID_LINK_LOST_TIMEOUT_MS 15000
+
+/* Effective link-lost timeout for a peer that declared its status
+ * heartbeat period in a status v5 frame (heartbeat_sec seconds;
+ * 0 = no declaration, e.g. an older keyboard): two missed
+ * heartbeats plus a 5 s margin, never below the fixed timeout. */
+static inline int64_t esb_hid_link_lost_timeout_ms(uint8_t heartbeat_sec) {
+    int64_t declared = (int64_t)heartbeat_sec * 2000 + 5000;
+
+    return declared > ESB_HID_LINK_LOST_TIMEOUT_MS ? declared : ESB_HID_LINK_LOST_TIMEOUT_MS;
+}
 
 /* Maximum device name length in characters (excluding the NUL).
  * Carried in status v2 frames and in the pairing exchange; defined
@@ -45,6 +58,8 @@ struct esb_hid_device_status {
     uint8_t flags;
     uint8_t output; /* ESB_HID_STATUS_OUTPUT_* decoded from flags */
     uint8_t proto_version;
+    uint8_t heartbeat_sec; /* status heartbeat period (s) declared in
+                              status v5 frames; 0 = not declared */
     char name[ESB_HID_NAME_MAX + 1]; /* from status v2 frames; "" for v1 peers */
     char layer_name[ESB_HID_LAYER_NAME_MAX + 1]; /* from status v3 frames; "" for v1/v2 peers */
     int64_t last_update_ms;         /* k_uptime_get() of the last status frame */

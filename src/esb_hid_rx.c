@@ -30,6 +30,7 @@
 #include <esb_hid_status.h>
 #include <zephyr/drivers/gpio.h>
 #include <zmk/hid.h>
+#include <zmk/usb.h>
 #include <zmk/usb_hid.h>
 
 #include "esb_hid_frame.h"
@@ -1057,7 +1058,7 @@ int esb_hid_rx_get_slot_info(uint8_t slot, struct esb_hid_slot_info *out) {
         int64_t age = k_uptime_get() - peers[slot].last_seen_ms;
 
         out->last_seen_age_ms = age;
-        out->link_up = age < ESB_HID_LINK_LOST_TIMEOUT_MS;
+        out->link_up = age < esb_hid_link_lost_timeout_ms(peers[slot].status.heartbeat_sec);
     }
     k_mutex_unlock(&esb_hid_rx_mutex);
     return 0;
@@ -1185,22 +1186,34 @@ static void handle_status(uint8_t slot, const uint8_t *data, size_t len) {
         battery_peer = data[trailer_offset];
     }
 
+    /* Status v5 heartbeat trailer: the status heartbeat period
+     * (seconds) the keyboard is currently running, after the v4
+     * peer battery byte. 0 = not declared (v1-v4 keyboards); the
+     * link-lost judgement then uses the fixed timeout. */
+    uint8_t heartbeat_sec = 0;
+
+    if (body->proto_version >= 5 && trailer_offset + 1 < len) {
+        heartbeat_sec = data[trailer_offset + 1];
+    }
+
     if (!peer->status.valid || peer->status.battery != body->battery ||
         peer->status.battery_peer != battery_peer ||
         peer->status.layer != body->layer || peer->status.output != output ||
+        peer->status.heartbeat_sec != heartbeat_sec ||
         strcmp(peer->status.name, name) != 0 ||
         strcmp(peer->status.layer_name, layer_name) != 0) {
         if (body->battery == ESB_HID_BATTERY_UNKNOWN) {
-            LOG_INF("Peer %d status: battery unknown, layer %d, output %d", slot, body->layer,
-                    output);
+            LOG_INF("Peer %d status: battery unknown, layer %d, output %d, hb %d s", slot,
+                    body->layer, output, heartbeat_sec);
         } else {
-            LOG_INF("Peer %d status: battery %d%%, layer %d, output %d", slot, body->battery,
-                    body->layer, output);
+            LOG_INF("Peer %d status: battery %d%%, layer %d, output %d, hb %d s", slot,
+                    body->battery, body->layer, output, heartbeat_sec);
         }
     }
 
     peer->status.battery = body->battery;
     peer->status.battery_peer = battery_peer;
+    peer->status.heartbeat_sec = heartbeat_sec;
     peer->status.layer = body->layer;
     peer->status.flags = body->flags;
     peer->status.output = output;
@@ -1345,6 +1358,59 @@ static void identity_maybe_load(uint8_t slot) {
     }
 }
 
+/* Host sleep state (power saving, 2026-11-20): while the USB host
+ * has the bus suspended, the keyboards are told so over
+ * ESB_HID_TYPE_HOST_STATE ACK payloads — piggybacked periodically
+ * and on change, exactly like SLOT_IDENTITY — and stretch their
+ * status heartbeat to the quiet period. Silence is expected then,
+ * so the failover watchdog is suppressed while the host is asleep
+ * (nobody is typing anyway). All state below is guarded by
+ * esb_hid_rx_mutex: host_state_refresh() runs from handle_payload
+ * and from the failover watchdog, both under the mutex. */
+#define ESB_HID_HOST_STATE_PERIOD_MS 10000
+static bool host_asleep;
+static bool host_state_dirty = true;
+static int64_t host_state_last_sent_ms;
+static uint8_t host_state_seq;
+
+static void host_state_refresh(void) {
+    bool asleep = (zmk_usb_get_status() == USB_DC_SUSPEND);
+
+    if (asleep != host_asleep) {
+        host_asleep = asleep;
+        host_state_dirty = true;
+        LOG_INF("Host %s", asleep ? "asleep (USB suspended), keyboards go quiet"
+                                  : "awake (USB resumed)");
+    }
+}
+
+/* Queue one HOST_STATE ACK payload on a slot pipe. Callers hold
+ * esb_hid_rx_mutex (handle_payload context). A failed write leaves
+ * the bookkeeping untouched so the next received frame retries. */
+static void host_state_load_payload(uint8_t slot) {
+    struct esb_payload payload = {
+        .length = ESB_HID_FRAME_HDR_LEN + 1,
+        .pipe = slot,
+        .noack = 0,
+    };
+    payload.data[0] = ESB_HID_TYPE_HOST_STATE;
+    payload.data[1] = host_state_seq++;
+    payload.data[ESB_HID_FRAME_HDR_LEN] = host_asleep ? ESB_HID_HOST_STATE_ASLEEP : 0;
+
+    if (esb_write_payload(&payload) == 0) {
+        host_state_last_sent_ms = k_uptime_get();
+        host_state_dirty = false;
+    }
+}
+
+static void host_state_maybe_load(uint8_t slot) {
+    host_state_refresh();
+    if (host_state_dirty || host_state_last_sent_ms == 0 ||
+        k_uptime_get() - host_state_last_sent_ms >= ESB_HID_HOST_STATE_PERIOD_MS) {
+        host_state_load_payload(slot);
+    }
+}
+
 static void handle_payload(const struct esb_payload *payload) {
     if (payload->length < ESB_HID_FRAME_HDR_LEN) {
         return;
@@ -1413,6 +1479,10 @@ static void handle_payload(const struct esb_payload *payload) {
          * arriving as a regular uplink frame is a protocol error;
          * never forward it to USB HID. */
         break;
+    case ESB_HID_TYPE_HOST_STATE:
+        /* Host state likewise only ever travels as an ACK payload
+         * (RX->TX); ignore it as a regular uplink frame. */
+        break;
     case ESB_HID_TYPE_POLL:
         /* Polls exist only to pull ACK payloads; nothing to forward.
          * (The ACK refill itself is triggered from the RX event
@@ -1451,6 +1521,7 @@ static void handle_payload(const struct esb_payload *payload) {
     }
 
     identity_maybe_load(slot);
+    host_state_maybe_load(slot);
 
     k_mutex_unlock(&esb_hid_rx_mutex);
 }
@@ -1471,17 +1542,20 @@ K_THREAD_DEFINE(esb_hid_rx_thread, 1024, rx_thread, NULL, NULL, NULL, K_PRIO_PRE
 /* ------------------------------------------------------------------ */
 /* Active-slot failover                                                */
 
-/* When the active keyboard has been silent past the link-lost
- * timeout (ESB_HID_LINK_LOST_TIMEOUT_MS — the same 15 s the display
- * greys it out at, three missed 5 s status frames), hand active to
- * the freshest other registered keyboard that is still on the air,
- * so typing continues on the surviving keyboard instead of dying
- * with the one that was switched off or walked away. There is no
- * automatic fail-back: when the original keyboard returns it does
- * not steal active back (the user can switch manually), which also
- * keeps two keyboards at the edge of range from flapping active
- * between them. The switch itself is esb_hid_rx_set_active_slot(),
- * with its usual release / Studio flush / re-inject contract. */
+/* When the active keyboard has been silent past its link-lost
+ * timeout (the fixed 15 s, or the longer value derived from the
+ * status v5 heartbeat declaration — the same judgement the display
+ * greys it out with), hand active to the freshest other registered
+ * keyboard that is still on the air, so typing continues on the
+ * surviving keyboard instead of dying with the one that was
+ * switched off or walked away. There is no automatic fail-back:
+ * when the original keyboard returns it does not steal active back
+ * (the user can switch manually), which also keeps two keyboards
+ * at the edge of range from flapping active between them. The
+ * switch itself is esb_hid_rx_set_active_slot(), with its usual
+ * release / Studio flush / re-inject contract. While the USB host
+ * is asleep the switch is suppressed entirely: the keyboards are
+ * quiet on purpose then, and their silence means nothing. */
 #define ESB_HID_ACTIVE_WATCHDOG_MS 1000
 
 static void active_watchdog(struct k_work *work);
@@ -1497,23 +1571,31 @@ static void active_watchdog(struct k_work *work) {
     k_mutex_lock(&esb_hid_rx_mutex, K_FOREVER);
     uint8_t active = registry.active_slot;
     bool pairing_busy = (pairing.state != ESB_HID_PAIRING_IDLE);
+    int64_t active_timeout_ms = 0;
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_BOOT_PAIRING)
     pairing_busy = pairing_busy || boot_pairing_armed;
 #endif
 
+    /* Keep the host sleep state fresh even when no frames arrive
+     * to piggyback a refresh on; while the host is asleep, silence
+     * is expected and must never fail over. */
+    host_state_refresh();
+
     if (active < ESB_HID_SLOT_COUNT && registry.slots[active].used && !pairing_busy &&
-        peers[active].last_seen_ms != 0) {
+        !host_asleep && peers[active].last_seen_ms != 0) {
         int64_t now = k_uptime_get();
 
-        if (now - peers[active].last_seen_ms > ESB_HID_LINK_LOST_TIMEOUT_MS) {
+        active_timeout_ms = esb_hid_link_lost_timeout_ms(peers[active].status.heartbeat_sec);
+        if (now - peers[active].last_seen_ms > active_timeout_ms) {
             int64_t freshest = 0;
 
             for (int i = 0; i < ESB_HID_SLOT_COUNT; i++) {
                 if (i == active || !registry.slots[i].used || peers[i].last_seen_ms == 0) {
                     continue;
                 }
-                if (now - peers[i].last_seen_ms <= ESB_HID_LINK_LOST_TIMEOUT_MS &&
+                if (now - peers[i].last_seen_ms <=
+                        esb_hid_link_lost_timeout_ms(peers[i].status.heartbeat_sec) &&
                     peers[i].last_seen_ms > freshest) {
                     freshest = peers[i].last_seen_ms;
                     target = (uint8_t)i;
@@ -1524,8 +1606,8 @@ static void active_watchdog(struct k_work *work) {
     k_mutex_unlock(&esb_hid_rx_mutex);
 
     if (target < ESB_HID_SLOT_COUNT) {
-        LOG_INF("Active slot %d silent past %d ms; failing over to slot %d", active,
-                ESB_HID_LINK_LOST_TIMEOUT_MS, target);
+        LOG_INF("Active slot %d silent past %lld ms; failing over to slot %d", active,
+                active_timeout_ms, target);
         esb_hid_rx_set_active_slot(target);
     }
 #endif /* IS_ENABLED(CONFIG_ZMK_ESB_HID_RX_AUTO_ACTIVE) */

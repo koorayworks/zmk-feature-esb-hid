@@ -43,6 +43,14 @@ int esb_hid_link_start(enum esb_mode mode, esb_event_handler handler) {
         config.mode = mode;
         config.event_handler = handler;
         config.tx_output_power = 4;
+#if IS_ENABLED(CONFIG_ZMK_ESB_HID)
+        if (mode == ESB_MODE_PTX) {
+            /* Keyboard side is battery powered: use the configured
+             * (lower) transmit power. The receiver is USB powered
+             * and keeps +4 dBm for its ACK payloads. */
+            config.tx_output_power = CONFIG_ZMK_ESB_HID_TX_OUTPUT_POWER;
+        }
+#endif
         config.retransmit_delay = 500;
         config.retransmit_count = 7;
 

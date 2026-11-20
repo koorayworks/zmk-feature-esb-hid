@@ -83,9 +83,25 @@
  * older firmware never send it, and its ABSENCE must never be treated
  * as a mismatch. See DESIGN.md "SLOT_IDENTITY" (2026-11-15). */
 #define ESB_HID_TYPE_SLOT_IDENTITY 9
-#define ESB_HID_TYPE_COUNT 10
+/* Host state (RX->TX, ACK payloads only, never a regular uplink
+ * frame). Body is a single flags byte; bit0
+ * (ESB_HID_HOST_STATE_ASLEEP) is set while the USB host has the bus
+ * suspended (host asleep). The receiver piggybacks it on ACKs the
+ * same way as SLOT_IDENTITY (periodic + on change) so keyboards can
+ * stretch their status heartbeat while nobody can be typing anyway;
+ * any local key/mouse activity ends the quiet state immediately, and
+ * the key frame that follows is what wakes the host (USB remote
+ * wakeup via the receiver). Keyboards with older firmware ignore
+ * this type in their ACK-payload switch's default case; receivers
+ * with older firmware never send it. See DESIGN.md power saving
+ * (2026-11-20). */
+#define ESB_HID_TYPE_HOST_STATE 10
+#define ESB_HID_TYPE_COUNT 11
 
 #define ESB_HID_SLOT_IDENTITY_REGISTERED 0x01
+
+/* Host state flags (body[0] of ESB_HID_TYPE_HOST_STATE). */
+#define ESB_HID_HOST_STATE_ASLEEP 0x01
 
 #define ESB_HID_PAIR_PROTO_VERSION 2
 #define ESB_HID_PAIR_SLOT_NOT_YET 0xFF
@@ -140,8 +156,15 @@
  * charge of the keyboard's split peer (the other half), as last
  * reported to the central, or ESB_HID_BATTERY_UNKNOWN when the
  * keyboard is not split or the peer level is unknown. v1-v3 frames
- * are still accepted, with an unknown peer battery. */
-#define ESB_HID_PROTOCOL_VERSION 4
+ * are still accepted, with an unknown peer battery.
+ * Status protocol v5: proto_version = 5 and a 1-byte heartbeat
+ * trailer appended after the v4 peer battery trailer: the status
+ * heartbeat period (seconds) the keyboard is currently running —
+ * it adapts to activity and to the host sleep state, and the
+ * receiver derives its link-lost timeout from the declared value
+ * instead of assuming 5 s. v1-v4 frames are still accepted, with
+ * no declaration (the receiver falls back to the fixed timeout). */
+#define ESB_HID_PROTOCOL_VERSION 5
 
 struct esb_hid_status_body {
     uint8_t battery;       /* 0-100 %, ESB_HID_BATTERY_UNKNOWN if unavailable */
